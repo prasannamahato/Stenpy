@@ -11,7 +11,7 @@ import time
 import uuid
 import warnings
 from collections import OrderedDict, deque
-from concurrent.futures import Future, ThreadPoolExecutor  # FIX 3: replace _AsyncFuture
+from concurrent.futures import Future, ThreadPoolExecutor  
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -109,9 +109,6 @@ class BufferState:
         self.load_failed      = False
         self.last_modified    = time.monotonic()
 
-# FIX 3: _AsyncFuture removed entirely. concurrent.futures.Future is used throughout.
-# It provides identical set_result / set_exception / result(timeout) semantics with
-# proper cancellation, thread-safety, and no reimplementation burden.
 
 # ----------------------------------------------------------------------
 # AdaptiveThrottler
@@ -175,10 +172,6 @@ def _pin_thread_to_numa_node(node: int) -> None:
 
 # ----------------------------------------------------------------------
 # SpillManager
-# FIX 4: load_async uses a bounded ThreadPoolExecutor instead of spawning
-#         one daemon thread per callback.
-# FIX 6: Filenames are a stable SHA-1 of (key, generation).  No timestamp,
-#         no _key_to_path indirection — the path is always computable.
 # ----------------------------------------------------------------------
 class SpillManager:
     """
@@ -449,12 +442,8 @@ class PinnedPool:
         return backing[:numel].view(shape).zero_()
 
     def release(self, buf: torch.Tensor) -> None:
-        # FIX 2: do NOT clone the buffer being returned to the pool.
-        # Cloning on every release silently turned every free() into a malloc(),
-        # defeating the entire purpose of pooling.
         if buf is None:
             return
-        # reshape(-1) is zero-copy when the tensor is contiguous (the common case).
         stored     = buf.reshape(-1)
         numel      = stored.numel()
         bucket     = self._bucket(numel)
@@ -567,23 +556,7 @@ class _IndexedHeap:
         return len(self._heap)
 
 # ----------------------------------------------------------------------
-# EvictionPolicy
-#
-# FIX 1: select_victim no longer re-pushes every live entry into the heap
-# on every call. That was O(n log n) per eviction — worse than a list scan
-# and completely negating the point of keeping a heap.
-#
-# Instead:
-#   • touch(key, state) computes the score from the live BufferState and
-#     pushes ONE entry into the heap. O(log n).
-#   • select_victim just pops from the heap, skipping stale or ineligible
-#     entries via lazy deletion. O(log n) amortised.
-#
-# Score convention (all heap-backed policies): lower score = evict first.
-#   lru_freq   : score = -(access_count * 0.7 + recency * 0.3)
-#                Cold entries score low → popped first. ✓
-#   lru_size   : score = -size_bytes   Largest entries score low → first. ✓
-#   largest_first: same as lru_size.
+# EvictionPolicy                                                                                                                                                                                
 # ----------------------------------------------------------------------
 class EvictionPolicy:
     """
@@ -637,10 +610,6 @@ class EvictionPolicy:
                 if state and _eligible(state):
                     return key
             return None
-
-        # All heap-backed policies: pop until we find an eligible live entry.
-        # Stale heap entries (invalidated via version bump in remove()) are
-        # skipped automatically by pop_valid(). O(log n) amortised.
         with self._hlock:
             while True:
                 key = self._heap.pop_valid()
@@ -817,12 +786,6 @@ class MemoryManager:
 
     # ------------------------------------------------------------------
     # Metadata cleaner
-    # FIX 5: len(self._live) is now read under _live_lock, not under
-    #         _cleaner_cond alone.  Previously another thread could mutate
-    #         _live between the len() read and the wait, which is a data race
-    #         on CPython's dict internals even though the GIL makes it
-    #         unlikely to crash — it still produced incorrect interval
-    #         decisions under concurrent load.
     # ------------------------------------------------------------------
     def _metadata_cleaner_loop(self) -> None:
         while not self._cleaner_stop:
@@ -1015,7 +978,6 @@ class MemoryManager:
                     self._pending_writes_cond.wait(timeout=remaining)
                 state.last_access   = time.monotonic()
                 state.access_count += 1
-                # FIX 1: pass state so touch() computes an accurate score.
                 self.eviction.touch(key, state)
                 if self._telemetry:
                     self._telemetry.inc("allocation_hits")
@@ -1044,7 +1006,6 @@ class MemoryManager:
                     state.last_access   = time.monotonic()
                     state.access_count += 1
                     state.last_modified = time.monotonic()
-                    # FIX 1: pass state.
                     self.eviction.touch(key, state)
                     if self._telemetry:
                         self._telemetry.inc("loads")
@@ -1120,10 +1081,9 @@ class MemoryManager:
                 is_pinned=(device.type == "cpu" and tensor.is_pinned()),
             )
             self._live[key] = new_state
-            # FIX 1: pass new_state so score is computed from real metadata.
             self.eviction.touch(key, new_state)
 
-        tensor._mm_key = key  # type: ignore[attr-defined]
+        tensor._mm_key = key 
         return tensor
 
     @staticmethod
