@@ -201,7 +201,6 @@ class SpillManager:
         self._files_lru: OrderedDict   = OrderedDict()  # path -> (size, key, gen)
         self._lock                     = threading.RLock()
 
-        # FIX 4: bounded pool — no unbounded thread-per-callback explosion.
         self._callback_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="mm-load-cb"
         )
@@ -209,8 +208,6 @@ class SpillManager:
         self._throttler = AdaptiveThrottler(self._write_queue)
         self._start_workers()
 
-    # FIX 6: deterministic, collision-resistant path derived from (key, generation).
-    # No timestamp means no _key_to_path lookup table is needed.
     @staticmethod
     def _get_path(spill_dir: str, key: str, generation: int) -> str:
         digest = hashlib.sha1(f"{key}\x00{generation}".encode()).hexdigest()
@@ -278,7 +275,6 @@ class SpillManager:
         file_size = os.path.getsize(path)
 
         with self._lock:
-            # FIX 6: old path is derived, not looked up.
             if old_generation >= 0:
                 old_path = self._path(key, old_generation)
                 if old_path in self._files_lru:
@@ -297,7 +293,6 @@ class SpillManager:
         self.on_write_complete(key, generation)
 
     def _load_sync(self, key: str, generation: int) -> Optional[torch.Tensor]:
-        # FIX 6: path is computed, not looked up in a side-table.
         path = self._path(key, generation)
         if not os.path.exists(path):
             return None
@@ -346,7 +341,6 @@ class SpillManager:
         generation: int,
         callback: Callable[[Optional[torch.Tensor]], None],
     ) -> None:
-        # FIX 4: submit to bounded executor; never spawn unbounded daemon threads.
         future: Future = Future()
         self._read_queue.put((key, generation, future))
         self._callback_executor.submit(
@@ -369,7 +363,6 @@ class SpillManager:
             callback(None)
 
     def delete_generation(self, key: str, generation: int) -> None:
-        # FIX 6: derive path directly.
         path = self._path(key, generation)
         with self._lock:
             if path in self._files_lru:
@@ -564,7 +557,7 @@ class EvictionPolicy:
     """
     def __init__(self, policy: str = "lru_freq") -> None:
         self.policy  = policy
-        self._order: OrderedDict = OrderedDict()  # used only for 'lru'
+        self._order: OrderedDict = OrderedDict() 
         self._heap   = _IndexedHeap()
         self._hlock  = threading.RLock()
 
@@ -580,13 +573,12 @@ class EvictionPolicy:
                 self._order[key] = True
             return
 
-        # Heap-backed policies — one push, O(log n).
         if state is not None:
             now = time.monotonic()
             if self.policy == "lru_freq":
                 recency = 1.0 / (now - state.last_access + 1e-9)
                 score   = -(state.access_count * 0.7 + recency * 0.3)
-            else:  # lru_size / largest_first
+            else:
                 score = -float(state.size_bytes)
         else:
             score = 0.0
@@ -1339,7 +1331,6 @@ class MemoryManager:
             if key not in self._live:
                 st = BufferState(key, tensor, is_pinned=tensor.is_pinned())
                 self._live[key] = st
-                # FIX 1: pass state.
                 self.eviction.touch(key, st)
                 tensor._mm_key = key
         return Field(tensor=tensor, spacing=spacing, origin=origin, mm=self, key=key)
