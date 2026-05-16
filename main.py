@@ -847,8 +847,16 @@ def _encode_kw_value(val: str) -> str:
     val = val.replace('+', '_POS_').replace('-', '_NEG_').replace('.', '_DOT_')
     return val
 
-def _decode_kw_value(enc: str) -> str:
-    enc = enc.replace('_POS_', '+').replace('_NEG_', '-').replace('_DOT_', '.')
+def _decode_kw_value(enc: str) -> Any:
+    # Try int, then float, then leave as string
+    try:
+        return int(enc)
+    except ValueError:
+        pass
+    try:
+        return float(enc)
+    except ValueError:
+        pass
     return enc
 
 def _encode_kwargs(s: str) -> str:
@@ -860,10 +868,13 @@ def _encode_kwargs(s: str) -> str:
         pos_args, kw_parts = [], []
         for part in raw_args.split(","):
             part = part.strip()
-            if "=" in part:
+            if "=" in part and not part.startswith("_kw_"):
                 k, v = part.split("=", 1)
-                encoded = _encode_kw_value(v.strip())
-                kw_parts.append(f"_kw_{k.strip()}_{encoded}")
+                # JSON-encode the value so any float is safe
+                encoded = json.dumps(v.strip())
+                # strip quotes, use base64-safe delimiter
+                token = encoded.replace('"', '').replace(' ', '')
+                kw_parts.append(f"_kw_{k.strip()}__{token}")
             else:
                 pos_args.append(part)
         return f"{fname}({', '.join(pos_args + kw_parts)})"
@@ -941,25 +952,17 @@ class _CompileCtx:
 def _decode_kwparams(func_name: str,
                      args: Tuple) -> Tuple[str, Dict[str, Any], List]:
     real_args: List    = []
-    kwargs:    Dict[str, Any] = {} 
+    kwargs:    Dict[str, Any] = {}
 
     for a in args:
         s = str(a)
         if s.startswith("_kw_"):
-            rest = s[4:]
-            idx  = rest.index("_")          
-            key      = rest[:idx]
-            val_enc  = rest[idx + 1:]
-            val_str  = _decode_kw_value(val_enc)   
-            parsed: Any = val_str
-            try:
-                parsed = int(val_str)
-            except ValueError:
-                try:
-                    parsed = float(val_str)
-                except ValueError:
-                    pass
-            kwargs[key] = parsed
+            # format: _kw_<key>__<value>
+            rest = s[4:]  # strip _kw_
+            sep  = rest.index("__")
+            key      = rest[:sep]
+            val_str  = rest[sep + 2:]
+            kwargs[key] = _decode_kw_value(val_str)
         else:
             real_args.append(a)
 
