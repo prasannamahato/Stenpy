@@ -1,5 +1,3 @@
-# main.py
-
 from __future__ import annotations
 import argparse
 import datetime
@@ -18,14 +16,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
 
-# tqdm
 try:
     from tqdm import tqdm as _tqdm
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
 
-# SymPy required
 try:
     import sympy as sp
     from sympy import Function, Symbol, Add, Mul, Pow
@@ -33,7 +29,6 @@ try:
 except ImportError:
     sys.exit("SymPy is required: pip install sympy")
 
-# stenpy
 try:
     import stenpy
 except ImportError:
@@ -156,8 +151,8 @@ def _vram_bar(device: torch.device, width: int = 28) -> str:
     peak  = torch.cuda.max_memory_allocated(device)
     frac  = used  / total
     pfrac = peak  / total
-    fi    = int(frac  * width)
-    pi    = int(pfrac * width)
+    fi    = min(int(frac  * width), width)
+    pi    = min(int(pfrac * width), width)
     bar   = "█" * fi + "▒" * max(0, pi - fi) + "░" * (width - max(fi, pi))
     pct   = frac * 100
     return (f"[{bar}] {used/1024**3:.2f}/{total/1024**3:.2f} GB  "
@@ -275,7 +270,7 @@ _FLOP_PER_ELEMENT: Dict[str, float] = {
     "mean_curvature":    30.0,
     "surface_normals":   18.0,
     "material_derivative":22.0,
-    "spectral_gradient":  0.0,  
+    "spectral_gradient":  0.0,
     "spectral_laplacian": 0.0,
     "fft":                0.0,
     "ifft":               0.0,
@@ -291,8 +286,8 @@ def _ast_flops(expr: sp.Expr, n_elem: int) -> float:
         return 0.0
 
     if isinstance(expr, (sp.Symbol,
-                         sp.Number,          
-                         sp.NumberSymbol,   
+                         sp.Number,
+                         sp.NumberSymbol,
                          sp.core.numbers.ImaginaryUnit)):
         return 0.0
 
@@ -300,7 +295,7 @@ def _ast_flops(expr: sp.Expr, n_elem: int) -> float:
         func_name = type(expr).__name__
         canonical = _ALIAS.get(func_name.lower(), func_name.lower())
         fpe       = _FLOP_PER_ELEMENT.get(canonical, 1.0)
-        if fpe == 0.0:      
+        if fpe == 0.0:
             op_flops = 5.0 * n_elem * max(1.0, math.log2(max(n_elem, 2)))
         else:
             op_flops = fpe * n_elem
@@ -324,18 +319,18 @@ def _ast_flops(expr: sp.Expr, n_elem: int) -> float:
     if isinstance(expr, sp.Pow):
         base, exp_s  = expr.args
         exp_val      = float(exp_s)
-        child_flops  = _ast_flops(base, n_elem)  
+        child_flops  = _ast_flops(base, n_elem)
 
-        if abs(exp_val - 1.0) < 1e-9:            
+        if abs(exp_val - 1.0) < 1e-9:
             return child_flops
-        if abs(exp_val - 0.5) < 1e-9:             
+        if abs(exp_val - 0.5) < 1e-9:
             return _FLOP_PER_ELEMENT.get("sqrt", 4.0) * n_elem + child_flops
 
         exp_is_int = abs(exp_val - round(exp_val)) < 1e-9
         exp_int    = int(round(abs(exp_val))) if exp_is_int else None
         if exp_is_int and exp_int is not None and 2 <= exp_int <= 8:
             mul_cost = (exp_int - 1) * _FLOP_PER_ELEMENT["mul"] * n_elem
-            if exp_val < 0:                 
+            if exp_val < 0:
                 mul_cost += _FLOP_PER_ELEMENT["div"] * n_elem
             return mul_cost + child_flops
 
@@ -618,7 +613,7 @@ def _print_perf_report(
     _divider()
 
     for i, s in enumerate(stats_list, 1):
-        expr_short = _truncate(s.expr_str, col_e)   
+        expr_short = _truncate(s.expr_str, col_e)
         bw   = s.overall_bw_gbs()
         tf   = s.tflops()
         bw_s = f"{bw:.2f}" if bw > 0 else "—"
@@ -835,23 +830,20 @@ def _show_user_vars() -> None:
 # Expression parser
 # ----------------------------------------------------------------------
 
-
-def _encode_kw_value(val: str) -> str:
-    val = val.strip()
-    val = val.replace('+', '_POS_').replace('-', '_NEG_').replace('.', '_DOT_')
-    return val
-
 def _decode_kw_value(enc: str) -> Any:
-    # Try int, then float, then leave as string
     try:
-        return int(enc)
+        decoded = bytes.fromhex(enc).decode()
+    except Exception:
+        decoded = enc
+    try:
+        return int(decoded)
     except ValueError:
         pass
     try:
-        return float(enc)
+        return float(decoded)
     except ValueError:
         pass
-    return enc
+    return decoded
 
 def _encode_kwargs(s: str) -> str:
     pattern = re.compile(r'(\w+)\s*\(([^()]*?)\)', re.DOTALL)
@@ -864,10 +856,7 @@ def _encode_kwargs(s: str) -> str:
             part = part.strip()
             if "=" in part and not part.startswith("_kw_"):
                 k, v = part.split("=", 1)
-                # JSON-encode the value so any float is safe
-                encoded = json.dumps(v.strip())
-                # strip quotes, use base64-safe delimiter
-                token = encoded.replace('"', '').replace(' ', '')
+                token = v.strip().encode().hex()
                 kw_parts.append(f"_kw_{k.strip()}__{token}")
             else:
                 pos_args.append(part)
@@ -951,8 +940,7 @@ def _decode_kwparams(func_name: str,
     for a in args:
         s = str(a)
         if s.startswith("_kw_"):
-            # format: _kw_<key>__<value>
-            rest = s[4:]  # strip _kw_
+            rest = s[4:]
             sep  = rest.index("__")
             key      = rest[:sep]
             val_str  = rest[sep + 2:]
@@ -968,7 +956,7 @@ def _op_params(canonical: str, dx: float, boundary: str) -> Dict[str, Any]:
         return {}
     return {"dx": dx, "boundary": boundary}
 
-def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:  
+def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
     if isinstance(expr, sp.Symbol):
         name = str(expr)
         if name in ctx.field_map:
@@ -1314,6 +1302,19 @@ def _open_hdf5_field(path: str) -> Tuple["_h5py.Dataset", Tuple[int, ...]]:
     ds = f[key]
     return ds, tuple(ds.shape)
 
+def _graph_multi_replace(
+    graph:        stenpy.Graph,
+    replacements: Dict[str, torch.Tensor],
+) -> stenpy.Graph:
+    g = stenpy.Graph()
+    for nid in graph._order:
+        node = graph._nodes[nid]
+        if nid in replacements:
+            g.add("_constant", (), {"value": replacements[nid]}, node_id=nid)
+        else:
+            g.add(node.op_name, node.input_ids, node.params, node_id=nid)
+    return g
+
 def _hdf5_direct_chunked_run(
     expr_str:    str,
     field_paths: Dict[str, str],
@@ -1392,7 +1393,6 @@ def _hdf5_direct_chunked_run(
         torch.cuda.empty_cache()
         _nerd(f"post-probe VRAM: {torch.cuda.memory_allocated(device)/1024**3:.3f} GB")
 
-    # Single shared runtime for all chunks — avoids per-chunk thread spawning
     _chunk_mm = stenpy.MemoryManager()
     _chunk_rt = stenpy.Runtime(_chunk_mm, device=str(device))
 
@@ -1467,106 +1467,129 @@ def _hdf5_direct_chunked_run(
     reader_t.start()
     writer_t.start()
 
-    with _make_bar(n_chunks, desc="Streaming", unit="chunk", colour="green") as bar:
-        while True:
-            item = read_q.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                raise item
+    try:
+        with _make_bar(n_chunks, desc="Streaming", unit="chunk", colour="green") as bar:
+            while True:
+                item = read_q.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
 
-            ci, row_start, row_end, chunk_np = item
+                ci, row_start, row_end, chunk_np = item
 
-            t_h2d_start = time.perf_counter()
-            chunk_tensors: Dict[str, torch.Tensor] = {}
-            for name, arr in chunk_np.items():
-                if not arr.flags["C_CONTIGUOUS"]:
-                    arr = np.ascontiguousarray(arr)
-                chunk_tensors[name] = torch.from_numpy(arr).to(device, non_blocking=True)
-                bytes_in += arr.nbytes
-            del chunk_np
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            chunk_h2d_times.append(time.perf_counter() - t_h2d_start)
+                t_h2d_start = time.perf_counter()
+                chunk_tensors: Dict[str, torch.Tensor] = {}
+                for name, arr in chunk_np.items():
+                    if not arr.flags["C_CONTIGUOUS"]:
+                        arr = np.ascontiguousarray(arr)
+                    t_cpu = torch.from_numpy(arr)
+                    if device.type == "cuda":
+                        chunk_tensors[name] = t_cpu.pin_memory().to(device, non_blocking=True)
+                    else:
+                        chunk_tensors[name] = t_cpu.to(device, non_blocking=True)
+                    bytes_in += arr.nbytes
+                del chunk_np
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                chunk_h2d_times.append(time.perf_counter() - t_h2d_start)
 
-            chunk_graph = pre_graph
-            for name, tensor in chunk_tensors.items():
-                if name in field_node_ids:
-                    chunk_graph = chunk_graph.clone_with_replacement(
-                        field_node_ids[name], tensor
-                    )
+                replacements = {
+                    field_node_ids[name]: tensor
+                    for name, tensor in chunk_tensors.items()
+                    if name in field_node_ids
+                }
+                chunk_graph = _graph_multi_replace(pre_graph, replacements)
 
-            t_compute_start = time.perf_counter()
-            with torch.no_grad():
-                chunk_results = _chunk_rt.run(chunk_graph)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            chunk_compute_times.append(time.perf_counter() - t_compute_start)
+                t_compute_start = time.perf_counter()
+                with torch.no_grad():
+                    chunk_results = _chunk_rt.run(chunk_graph)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                chunk_compute_times.append(time.perf_counter() - t_compute_start)
 
-            out_gpu = chunk_results.get(pre_sink)
+                out_gpu = chunk_results.get(pre_sink)
 
-            t_dh_start = time.perf_counter()
-            out_cpu = (out_gpu.detach().cpu()
-                    if isinstance(out_gpu, torch.Tensor)
-                    else torch.zeros((row_end - row_start,) + out_trailing,
-                                        dtype=torch.float64))
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            chunk_dh_times.append(time.perf_counter() - t_dh_start)
+                t_dh_start = time.perf_counter()
+                out_cpu = (out_gpu.detach().cpu()
+                        if isinstance(out_gpu, torch.Tensor)
+                        else torch.zeros((row_end - row_start,) + out_trailing,
+                                            dtype=torch.float64))
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                chunk_dh_times.append(time.perf_counter() - t_dh_start)
 
-            vram_before_free = (torch.cuda.memory_allocated(device)
-                                if device.type == "cuda" else 0)
-            n_live = len(_chunk_mm._live) if hasattr(_chunk_mm, "_live") else -1
+                vram_before_free = (torch.cuda.memory_allocated(device)
+                                    if device.type == "cuda" else 0)
+                n_live = len(_chunk_mm._live) if hasattr(_chunk_mm, "_live") else -1
 
-            del chunk_tensors
-            del chunk_results
-            del out_gpu
-            chunk_graph = None
-            _chunk_mm.clear_pool()
-            with _chunk_mm._lock:
-                _chunk_mm._live.clear()
-                _chunk_mm._pool_ptrs.clear()
+                del chunk_tensors
+                del chunk_results
+                del out_gpu
+                chunk_graph = None
+                _chunk_mm.clear_pool()
+                with _chunk_mm._lock:
+                    _chunk_mm._live.clear()
+                    if hasattr(_chunk_mm, '_pool_ptrs'):
+                        _chunk_mm._pool_ptrs.clear()
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-                vram_after = torch.cuda.memory_allocated(device)
-                freed_gb   = (vram_before_free - vram_after) / 1024**3
-                vram_pct   = vram_after / torch.cuda.get_device_properties(device).total_memory * 100
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    vram_after = torch.cuda.memory_allocated(device)
+                    freed_gb   = (vram_before_free - vram_after) / 1024**3
+                    vram_pct   = vram_after / torch.cuda.get_device_properties(device).total_memory * 100
 
-                if _NERD:
-                    sev = _sev_label(vram_pct)
-                    _rank0_print(
-                        f"\n  │  chunk {ci+1:>3}/{n_chunks}"
-                        f"  freed {freed_gb:.3f} GB"
-                        f"  live_refs {n_live}→0"
-                        f"  VRAM {vram_after/1024**3:.2f} GB"
-                        f"  {vram_pct:.0f}%{sev}"
-                    )
+                    if _NERD:
+                        sev = _sev_label(vram_pct)
+                        _rank0_print(
+                            f"\n  │  chunk {ci+1:>3}/{n_chunks}"
+                            f"  freed {freed_gb:.3f} GB"
+                            f"  live_refs {n_live}→0"
+                            f"  VRAM {vram_after/1024**3:.2f} GB"
+                            f"  {vram_pct:.0f}%{sev}"
+                        )
 
-                if vram_pct >= _T_CRIT:
-                    bar.set_postfix_str(
-                        f"  ██ CRIT {vram_pct:.0f}% VRAM — risk of OOM", refresh=True)
+                    if vram_pct >= _T_CRIT:
+                        bar.set_postfix_str(
+                            f"  ██ CRIT {vram_pct:.0f}% VRAM — risk of OOM", refresh=True)
 
-            write_q.put((row_start, row_end, out_cpu))
+                write_q.put((row_start, row_end, out_cpu))
 
-            elapsed = time.perf_counter() - t0
-            tput    = (bytes_in / 1024**3) / elapsed if elapsed > 0 else 0.0
-            bar.update(1)
-            if device.type == "cuda" and not _NERD:
-                vram_gb = torch.cuda.memory_allocated(device) / 1024**3
-                bar.set_postfix_str(f"{tput:.2f} GB/s  VRAM {vram_gb:.1f}GB", refresh=False)
-            else:
-                bar.set_postfix_str(f"{tput:.2f} GB/s", refresh=False)
+                elapsed = time.perf_counter() - t0
+                tput    = (bytes_in / 1024**3) / elapsed if elapsed > 0 else 0.0
+                bar.update(1)
+                if device.type == "cuda" and not _NERD:
+                    vram_gb = torch.cuda.memory_allocated(device) / 1024**3
+                    bar.set_postfix_str(f"{tput:.2f} GB/s  VRAM {vram_gb:.1f}GB", refresh=False)
+                else:
+                    bar.set_postfix_str(f"{tput:.2f} GB/s", refresh=False)
 
-    write_q.put(None)
-    reader_t.join()
-    writer_t.join()
-    write_q.join()
-    out_f.close()
+        write_q.put(None)
+        reader_t.join()
+        writer_t.join()
+        write_q.join()
 
-    for f in hdf5_files:
-        try: f.close()
-        except Exception: pass
+    except Exception:
+        try:
+            write_q.put(None, block=True, timeout=2.0)
+        except Exception:
+            pass
+        reader_t.join(timeout=10.0)
+        writer_t.join(timeout=10.0)
+        try:
+            write_q.join()
+        except Exception:
+            pass
+        raise
+
+    finally:
+        try:
+            out_f.close()
+        except Exception:
+            pass
+        for f in hdf5_files:
+            try: f.close()
+            except Exception: pass
 
     elapsed  = time.perf_counter() - t0
     out_gb   = _tensor_gb(out_full_shape)
@@ -1870,8 +1893,10 @@ class Pipeline:
                 probe_fm = dict(scalar_map_for_chunk)
                 for n, p in lazy_path_map.items():
                     ds, _ = _open_hdf5_field(p)
-                    probe_fm[n] = torch.from_numpy(ds[:2].astype(np.float64))
-                    ds.file.close()
+                    try:
+                        probe_fm[n] = torch.from_numpy(ds[:2].astype(np.float64))
+                    finally:
+                        ds.file.close()
                 _, _, warns, _, sympy_expr_for_flops = compile_expression(
                     expr_str, dx=self.dx, boundary=boundary, field_map=probe_fm
                 )
