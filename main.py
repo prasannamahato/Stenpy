@@ -94,7 +94,7 @@ def _hpc_scratch() -> str:
 # ----------------------------------------------------------------------
 # tqdm fallback
 # ----------------------------------------------------------------------
-  
+
 class _FallbackBar:
     def __init__(self, total=None, desc="", unit="", **kw):
         self.total = total or 0
@@ -122,19 +122,19 @@ class _FallbackBar:
 def _make_bar(total, desc="", unit="chunk", colour=None):
     if HAS_TQDM and (not _IS_HPC or _HPC_RANK == 0):
         return _tqdm(
-            total        = total,
-            desc         = f"  {desc}",
-            unit         = unit,
-            dynamic_ncols= True,
-            colour       = colour or "cyan",
-            bar_format   = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+            total         = total,
+            desc          = f"  {desc}",
+            unit          = unit,
+            dynamic_ncols = True,
+            colour        = colour or "cyan",
+            bar_format    = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
         )
     return _FallbackBar(total=total, desc=desc, unit=unit)
 
 # ----------------------------------------------------------------------
 # Nerd mode
 # ----------------------------------------------------------------------
-  
+
 _NERD = os.environ.get("OPS_NERD", "0").lower() in ("1", "true", "yes")
 
 _T_CRIT = 90
@@ -246,6 +246,7 @@ def _nerd(msg: str) -> None:
 # ----------------------------------------------------------------------
 # Performance instrumentation
 # ----------------------------------------------------------------------
+
 _FLOP_PER_ELEMENT: Dict[str, float] = {
     "add":                1.0,
     "sub":                1.0,
@@ -274,7 +275,7 @@ _FLOP_PER_ELEMENT: Dict[str, float] = {
     "mean_curvature":    30.0,
     "surface_normals":   18.0,
     "material_derivative":22.0,
-    "spectral_gradient":  0.0,
+    "spectral_gradient":  0.0,  
     "spectral_laplacian": 0.0,
     "fft":                0.0,
     "ifft":               0.0,
@@ -285,30 +286,65 @@ _FLOP_PER_ELEMENT: Dict[str, float] = {
     "deviatoric":         5.0,
 }
 
-def _estimate_flops(expr_str: str,
-                    output_shape: Optional[Tuple],
-                    input_shape:  Optional[Tuple] = None) -> float:
-    if output_shape is None:
+def _ast_flops(expr: sp.Expr, n_elem: int) -> float:
+    if n_elem <= 0:
         return 0.0
-    n_elem = max(1, math.prod(int(s) for s in output_shape))
-    n_in   = max(1, math.prod(int(s) for s in input_shape)) if input_shape else n_elem
 
-    ops_found: List[str] = []
-    for op in _FLOP_PER_ELEMENT:
-        if re.search(rf'\b{re.escape(op)}\b', expr_str):
-            ops_found.append(op)
+    if isinstance(expr, (sp.Symbol,
+                         sp.Number,          
+                         sp.NumberSymbol,   
+                         sp.core.numbers.ImaginaryUnit)):
+        return 0.0
 
-    if not ops_found:
-        return float(n_elem)
-
-    total = 0.0
-    for op in ops_found:
-        fpe = _FLOP_PER_ELEMENT[op]
-        if fpe == 0.0:
-            total += 5.0 * n_in * max(1.0, math.log2(n_in))
+    if isinstance(expr, sp.core.function.AppliedUndef):
+        func_name = type(expr).__name__
+        canonical = _ALIAS.get(func_name.lower(), func_name.lower())
+        fpe       = _FLOP_PER_ELEMENT.get(canonical, 1.0)
+        if fpe == 0.0:      
+            op_flops = 5.0 * n_elem * max(1.0, math.log2(max(n_elem, 2)))
         else:
-            total += fpe * n_elem
-    return total
+            op_flops = fpe * n_elem
+        child_flops = sum(_ast_flops(a, n_elem) for a in expr.args)
+        return op_flops + child_flops
+
+    if isinstance(expr, sp.Add):
+        add_flops   = max(0, len(expr.args) - 1) * _FLOP_PER_ELEMENT["add"] * n_elem
+        child_flops = sum(_ast_flops(a, n_elem) for a in expr.args)
+        return add_flops + child_flops
+
+    if isinstance(expr, sp.Mul):
+        if sp.Integer(-1) in expr.args and len(expr.args) == 2:
+            other = next(a for a in expr.args if a != sp.Integer(-1))
+            return (_FLOP_PER_ELEMENT["neg"] * n_elem
+                    + _ast_flops(other, n_elem))
+        mul_flops   = max(0, len(expr.args) - 1) * _FLOP_PER_ELEMENT["mul"] * n_elem
+        child_flops = sum(_ast_flops(a, n_elem) for a in expr.args)
+        return mul_flops + child_flops
+
+    if isinstance(expr, sp.Pow):
+        base, exp_s  = expr.args
+        exp_val      = float(exp_s)
+        child_flops  = _ast_flops(base, n_elem)  
+
+        if abs(exp_val - 1.0) < 1e-9:            
+            return child_flops
+        if abs(exp_val - 0.5) < 1e-9:             
+            return _FLOP_PER_ELEMENT.get("sqrt", 4.0) * n_elem + child_flops
+
+        exp_is_int = abs(exp_val - round(exp_val)) < 1e-9
+        exp_int    = int(round(abs(exp_val))) if exp_is_int else None
+        if exp_is_int and exp_int is not None and 2 <= exp_int <= 8:
+            mul_cost = (exp_int - 1) * _FLOP_PER_ELEMENT["mul"] * n_elem
+            if exp_val < 0:                 
+                mul_cost += _FLOP_PER_ELEMENT["div"] * n_elem
+            return mul_cost + child_flops
+
+        return ((_FLOP_PER_ELEMENT.get("log",  20.0) +
+                 _FLOP_PER_ELEMENT.get("mul",   1.0) +
+                 _FLOP_PER_ELEMENT.get("exp",  20.0)) * n_elem + child_flops)
+
+    return sum(_ast_flops(a, n_elem) for a in getattr(expr, "args", ()))
+
 
 def _gpu_peak_bw_gbs(device: torch.device) -> float:
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -334,7 +370,6 @@ def _gpu_name(device: torch.device) -> str:
 
 @dataclass
 class PerfStats:
-    """Performance telemetry for a single expression run."""
     expr_str:   str
     mode:       str
     input_gb:   float = 0.0
@@ -351,8 +386,8 @@ class PerfStats:
     chunk_compute_s: List[float] = dc_field(default_factory=list)
     chunk_dh_s:      List[float] = dc_field(default_factory=list)
     chunk_write_s:   List[float] = dc_field(default_factory=list)
-    n_chunks:        int = 0
-    chunk_rows:      int = 0
+    n_chunks:        int   = 0
+    chunk_rows:      int   = 0
     peak_vram_gb:    float = 0.0
     vram_total_gb:   float = 0.0
     est_flops:       float = 0.0
@@ -375,7 +410,7 @@ class PerfStats:
 def _arr_stats(vals: List[float]) -> Tuple[float, float, float, float]:
     if not vals:
         return 0.0, 0.0, 0.0, 0.0
-    a   = np.array(vals, dtype=float)
+    a = np.array(vals, dtype=float)
     return float(a.mean()), float(a.std()), float(a.min()), float(a.max())
 
 def _fmt_gb(v: float) -> str:
@@ -393,9 +428,9 @@ def _fmt_bw(v: float) -> str:
     return f"{v:.2f} GB/s"
 
 def _fmt_tf(v: float) -> str:
-    if v == 0.0: return "  —  "
-    if v >= 1.0: return f"{v:.3f} TFLOP/s"
-    if v >= 1e-3: return f"{v*1000:.2f} GFLOP/s"
+    if v == 0.0:   return "  —  "
+    if v >= 1.0:   return f"{v:.3f} TFLOP/s"
+    if v >= 1e-3:  return f"{v*1000:.2f} GFLOP/s"
     return f"{v*1e6:.1f} MFLOP/s"
 
 def _pct_bar(frac: float, width: int = 20) -> str:
@@ -403,11 +438,16 @@ def _pct_bar(frac: float, width: int = 20) -> str:
     filled = int(frac * width)
     return "█" * filled + "░" * (width - filled)
 
+def _truncate(s: str, n: int) -> str:
+    if len(s) <= n:
+        return s
+    return s[:n - 1] + "…"
+
 def _print_perf_report(
-    stats_list:  List[PerfStats],
-    device:      torch.device,
+    stats_list:   List[PerfStats],
+    device:       torch.device,
     total_wall_s: float,
-    verbose:     bool = True,
+    verbose:      bool = True,
 ) -> None:
     if not verbose or (_IS_HPC and _HPC_RANK != 0) or not stats_list:
         return
@@ -427,21 +467,21 @@ def _print_perf_report(
     def _blank() -> None:
         print(f"  │{' ' * W}│")
 
-    agg_input_gb   = sum(s.input_gb   for s in stats_list)
-    agg_output_gb  = sum(s.output_gb  for s in stats_list)
-    agg_flops      = sum(s.est_flops  for s in stats_list)
-    agg_t_read     = sum(s.t_read     for s in stats_list)
-    agg_t_h2d      = sum(s.t_h2d      for s in stats_list)
-    agg_t_compile  = sum(s.t_compile  for s in stats_list)
-    agg_t_compute  = sum(s.t_compute  for s in stats_list)
-    agg_t_d2h      = sum(s.t_d2h      for s in stats_list)
-    agg_t_write    = sum(s.t_write    for s in stats_list)
-    agg_chunks     = sum(s.n_chunks   for s in stats_list)
+    agg_input_gb  = sum(s.input_gb   for s in stats_list)
+    agg_output_gb = sum(s.output_gb  for s in stats_list)
+    agg_flops     = sum(s.est_flops  for s in stats_list)
+    agg_t_read    = sum(s.t_read     for s in stats_list)
+    agg_t_h2d     = sum(s.t_h2d      for s in stats_list)
+    agg_t_compile = sum(s.t_compile  for s in stats_list)
+    agg_t_compute = sum(s.t_compute  for s in stats_list)
+    agg_t_d2h     = sum(s.t_d2h      for s in stats_list)
+    agg_t_write   = sum(s.t_write    for s in stats_list)
+    agg_chunks    = sum(s.n_chunks   for s in stats_list)
 
-    peak_vram_gb   = max((s.peak_vram_gb  for s in stats_list), default=0.0)
-    vram_total_gb  = max((s.vram_total_gb for s in stats_list), default=0.0)
+    peak_vram_gb  = max((s.peak_vram_gb  for s in stats_list), default=0.0)
+    vram_total_gb = max((s.vram_total_gb for s in stats_list), default=0.0)
 
-    gpu_peak_bw = _gpu_peak_bw_gbs(device)
+    gpu_peak_bw  = _gpu_peak_bw_gbs(device)
     agg_tflops_s = (agg_flops / 1e12) / agg_t_compute if agg_t_compute > 1e-9 else 0.0
     agg_read_bw  = agg_input_gb  / agg_t_read    if agg_t_read    > 1e-9 else 0.0
     agg_write_bw = agg_output_gb / agg_t_write   if agg_t_write   > 1e-9 else 0.0
@@ -479,20 +519,20 @@ def _print_perf_report(
     print(f"  {'═' * W}")
 
     _hdr("OVERALL THROUGHPUT")
-    _row("Wall time (total):",        _fmt_s(total_wall_s))
-    _row("Data read from disk:",      _fmt_gb(agg_input_gb),
+    _row("Wall time (total):",       _fmt_s(total_wall_s))
+    _row("Data read from disk:",     _fmt_gb(agg_input_gb),
          f"→ {_fmt_bw(agg_read_bw)} read")
-    _row("Data written to disk:",     _fmt_gb(agg_output_gb),
+    _row("Data written to disk:",    _fmt_gb(agg_output_gb),
          f"→ {_fmt_bw(agg_write_bw)} write")
-    _row("Aggregate data moved:",     _fmt_gb(agg_input_gb + agg_output_gb))
+    _row("Aggregate data moved:",    _fmt_gb(agg_input_gb + agg_output_gb))
 
     if agg_flops > 0:
         if agg_flops >= 1e12:
-            flop_str = f"{agg_flops/1e12:.3f} TFLOP (est.)"
+            flop_str = f"{agg_flops/1e12:.3f} TFLOP (AST-estimated)"
         elif agg_flops >= 1e9:
-            flop_str = f"{agg_flops/1e9:.2f} GFLOP (est.)"
+            flop_str = f"{agg_flops/1e9:.2f} GFLOP (AST-estimated)"
         else:
-            flop_str = f"{agg_flops/1e6:.1f} MFLOP (est.)"
+            flop_str = f"{agg_flops/1e6:.1f} MFLOP (AST-estimated)"
         _row("Estimated FLOPs:", flop_str)
         _row("Achieved compute rate:", _fmt_tf(agg_tflops_s))
 
@@ -519,12 +559,12 @@ def _print_perf_report(
         pad   = W - len(inner)
         print(f"  │{inner}{' ' * max(0, pad)}│")
 
-    _stage_row("HDF5 read  (disk → CPU)",   agg_t_read, _fmt_bw(agg_read_bw))
-    _stage_row("H→D transfer  (CPU → GPU)", agg_t_h2d, _fmt_bw(agg_h2d_bw) + " (PCIe/NVLink)")
+    _stage_row("HDF5 read  (disk → CPU)",   agg_t_read,    _fmt_bw(agg_read_bw))
+    _stage_row("H→D transfer  (CPU → GPU)", agg_t_h2d,    _fmt_bw(agg_h2d_bw) + " (PCIe/NVLink)")
     _stage_row("Compile / graph trace",     agg_t_compile)
     _stage_row("GPU compute",               agg_t_compute, _fmt_tf(agg_tflops_s))
-    _stage_row("D→H transfer  (GPU → CPU)", agg_t_d2h, _fmt_bw(agg_d2h_bw) + " (PCIe/NVLink)")
-    _stage_row("HDF5 write  (CPU → disk)",  agg_t_write, _fmt_bw(agg_write_bw))
+    _stage_row("D→H transfer  (GPU → CPU)", agg_t_d2h,    _fmt_bw(agg_d2h_bw) + " (PCIe/NVLink)")
+    _stage_row("HDF5 write  (CPU → disk)",  agg_t_write,  _fmt_bw(agg_write_bw))
 
     _blank()
     stage_times = {
@@ -584,7 +624,7 @@ def _print_perf_report(
     _divider()
 
     for i, s in enumerate(stats_list, 1):
-        expr_short = s.expr_str[:col_e]
+        expr_short = _truncate(s.expr_str, col_e)   
         bw   = s.overall_bw_gbs()
         tf   = s.tflops()
         bw_s = f"{bw:.2f}" if bw > 0 else "—"
@@ -618,6 +658,7 @@ def _print_perf_report(
 # ----------------------------------------------------------------------
 # Symbolic operator vocabulary
 # ----------------------------------------------------------------------
+
 _ALIAS: Dict[str, str] = {
     "gradient":            "gradient",
     "grad":                "gradient",
@@ -713,9 +754,12 @@ _SIMPLIFY_RULES: Dict[Tuple[str, str], str] = {
     ("divergence", "gradient"):    "laplacian",
 }
 
+_RESERVED_SYMBOLS: frozenset = frozenset({"f", "g", "h", "u", "v", "x", "y", "z", "t"})
+
 # ----------------------------------------------------------------------
 # Short-form filename helper
 # ----------------------------------------------------------------------
+
 def _expr_to_filename(expr_str: str, src_stem: str) -> str:
     s = expr_str.strip()
     for long_name in sorted(_SHORT_OP, key=len, reverse=True):
@@ -730,7 +774,7 @@ def _expr_to_filename(expr_str: str, src_stem: str) -> str:
 # ----------------------------------------------------------------------
 # User-defined symbolic variables
 # ----------------------------------------------------------------------
-  
+
 @dataclass
 class UserVar:
     name:    str
@@ -787,27 +831,72 @@ def _show_user_vars() -> None:
     if not _USER_VARS:
         print("  (no user-defined variables yet — use [6] to add one)")
         return
-    print(f"\n  {'Name':<12}  {'Start':>10}  {'End':>10}  {'Steps':>6}  {'Current':>12}")
+    print(f"\n  {'Name':<12}  {'Start':>10}  {'End':>10}  {'Steps':>6}  {'Last used':>12}")
     print(f"  {'─'*12}  {'─'*10}  {'─'*10}  {'─'*6}  {'─'*12}")
     for uv in _USER_VARS.values():
         print(f"  {uv.name:<12}  {uv.start:>10.4g}  {uv.end:>10.4g}"
               f"  {uv.steps:>6}  {uv.current:>12.6g}")
 
 # ----------------------------------------------------------------------
-# Expression parser 
+# Expression parser
 # ----------------------------------------------------------------------
+
+
+def _encode_kw_value(val: str) -> str:
+    val = val.strip()
+    val = val.replace('+', '_POS_').replace('-', '_NEG_').replace('.', '_DOT_')
+    return val
+
+def _decode_kw_value(enc: str) -> str:
+    enc = enc.replace('_POS_', '+').replace('_NEG_', '-').replace('_DOT_', '.')
+    return enc
+
+def _encode_kwargs(s: str) -> str:
+    pattern = re.compile(r'(\w+)\s*\(([^()]*?)\)', re.DOTALL)
+
+    def _repl(m: re.Match) -> str:
+        fname    = m.group(1)
+        raw_args = m.group(2)
+        pos_args, kw_parts = [], []
+        for part in raw_args.split(","):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                encoded = _encode_kw_value(v.strip())
+                kw_parts.append(f"_kw_{k.strip()}_{encoded}")
+            else:
+                pos_args.append(part)
+        return f"{fname}({', '.join(pos_args + kw_parts)})"
+
+    prev = None
+    while prev != s:
+        prev = s
+        s    = pattern.sub(_repl, s)
+    return s
 
 def _build_sympy_namespace(field_names: Optional[Set[str]] = None) -> Dict[str, Any]:
     ns: Dict[str, Any] = {}
-    for sym in ("f", "g", "h", "u", "v", "x", "y", "z", "t"):
-        ns[sym] = sp.Symbol(sym)
-    if field_names:
-        for name in field_names:
-            if name not in ns:
-                ns[name] = sp.Symbol(name)
+    field_names = field_names or set()
+
+    shadows = _RESERVED_SYMBOLS & field_names
+    if shadows:
+        _rank0_print(
+            f"  ⚠  Field name(s) {sorted(shadows)} shadow reserved SymPy symbols.\n"
+            "     SymPy may simplify e.g. x/x → 1 before the compiler sees it.\n"
+            "     Use unique field names (pressure, temp, …) to avoid surprises."
+        )
+
+    for sym in _RESERVED_SYMBOLS:
+        if sym not in field_names:
+            ns[sym] = sp.Symbol(sym)
+
+    for name in field_names:
+        ns[name] = sp.Symbol(name)
+
     for name in _USER_VARS:
         if name not in ns:
             ns[name] = sp.Symbol(name)
+
     seen: Set[str] = set()
     for alias, canonical in _ALIAS.items():
         if alias not in seen:
@@ -816,31 +905,13 @@ def _build_sympy_namespace(field_names: Optional[Set[str]] = None) -> Dict[str, 
         if canonical not in seen:
             ns[canonical] = sp.Function(canonical)
             seen.add(canonical)
+
     ns["pi"] = sp.pi
     ns["E"]  = sp.E
     return ns
 
 def parse_expression(expr_str: str,
                      field_names: Optional[Set[str]] = None) -> sp.Expr:
-    def _encode_kwargs(s: str) -> str:
-        pattern = re.compile(r'(\w+)\s*\(([^()]*?)\)', re.DOTALL)
-        def _repl(m: re.Match) -> str:
-            fname    = m.group(1)
-            raw_args = m.group(2)
-            pos_args, kw_parts = [], []
-            for part in raw_args.split(","):
-                part = part.strip()
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    kw_parts.append(f"_kw_{k.strip()}_{v.strip()}")
-                else:
-                    pos_args.append(part)
-            return f"{fname}({', '.join(pos_args + kw_parts)})"
-        prev = None
-        while prev != s:
-            prev = s; s = pattern.sub(_repl, s)
-        return s
-
     cleaned = _encode_kwargs(expr_str.strip())
     ns = _build_sympy_namespace(field_names=field_names)
     for kf in re.findall(r'_kw_\w+', cleaned):
@@ -854,8 +925,9 @@ def parse_expression(expr_str: str,
         ) from exc
 
 # ----------------------------------------------------------------------
-# AST -> ops.Graph compiler
+# AST → ops.Graph compiler
 # ----------------------------------------------------------------------
+
 @dataclass
 class _CompileCtx:
     graph:     stenpy.Graph
@@ -868,19 +940,29 @@ class _CompileCtx:
 
 def _decode_kwparams(func_name: str,
                      args: Tuple) -> Tuple[str, Dict[str, Any], List]:
-    real_args, kwargs = [], []
+    real_args: List    = []
+    kwargs:    Dict[str, Any] = {} 
+
     for a in args:
         s = str(a)
         if s.startswith("_kw_"):
-            rest = s[4:]; idx = rest.index("_")
-            key  = rest[:idx]; val = rest[idx + 1:]
-            try:    val = int(val)
+            rest = s[4:]
+            idx  = rest.index("_")          
+            key      = rest[:idx]
+            val_enc  = rest[idx + 1:]
+            val_str  = _decode_kw_value(val_enc)   
+            parsed: Any = val_str
+            try:
+                parsed = int(val_str)
             except ValueError:
-                try: val = float(val)
-                except ValueError: pass
-            kwargs[key] = val
+                try:
+                    parsed = float(val_str)
+                except ValueError:
+                    pass
+            kwargs[key] = parsed
         else:
             real_args.append(a)
+
     canonical = _ALIAS.get(func_name.lower(), func_name.lower())
     return canonical, kwargs, real_args
 
@@ -889,14 +971,17 @@ def _op_params(canonical: str, dx: float, boundary: str) -> Dict[str, Any]:
         return {}
     return {"dx": dx, "boundary": boundary}
 
-def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
+def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:  
     if isinstance(expr, sp.Symbol):
         name = str(expr)
         if name in ctx.field_map:
             return ctx.field_map[name]
         if name in ("f", "g", "h", "u", "v"):
             return ctx.src_id
-        ctx.warnings.append(f"Unknown symbol '{name}' — using fallback field")
+        ctx.warnings.append(
+            f"Unknown symbol '{name}' — falling back to primary field.  "
+            "Check that all field names are loaded before evaluating."
+        )
         return ctx.src_id
 
     if isinstance(expr, (sp.Number, sp.Integer, sp.Float, sp.Rational)):
@@ -929,7 +1014,7 @@ def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
                     canonical = replacement
                     child_ids = child_node.input_ids
 
-        frozen = tuple(sorted(
+        frozen  = tuple(sorted(
             (k, v) for k, v in params.items()
             if isinstance(v, (int, float, str, bool))
         ))
@@ -961,7 +1046,7 @@ def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
     if isinstance(expr, sp.Mul):
         operands = list(expr.args)
         if sp.Integer(-1) in operands and len(operands) == 2:
-            other    = [o for o in operands if o != sp.Integer(-1)][0]
+            other    = next(o for o in operands if o != sp.Integer(-1))
             child_id = _compile_node(other, ctx)
             cse_key  = ("neg", (child_id,), ())
             if cse_key in ctx.cse_cache:
@@ -983,17 +1068,45 @@ def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
     if isinstance(expr, sp.Pow):
         base_id = _compile_node(expr.args[0], ctx)
         exp_val = float(expr.args[1])
+
+        if abs(exp_val - 1.0) < 1e-9:
+            return base_id
+
         if abs(exp_val - 0.5) < 1e-9:
             cse_key = ("sqrt", (base_id,), ())
-            if cse_key in ctx.cse_cache:
-                return ctx.cse_cache[cse_key]
-            nid = ctx.graph.add("sqrt", (base_id,), {})
-            ctx.cse_cache[cse_key] = nid
-            return nid
-        log_id    = ctx.graph.add("log",  (base_id,), {})
-        const_nid = _compile_node(sp.Float(exp_val), ctx)
-        mul_id    = ctx.graph.add("mul",  (log_id, const_nid), {})
-        return     ctx.graph.add("exp",  (mul_id,), {})
+            if cse_key not in ctx.cse_cache:
+                ctx.cse_cache[cse_key] = ctx.graph.add("sqrt", (base_id,), {})
+            return ctx.cse_cache[cse_key]
+
+        exp_is_int = abs(exp_val - round(exp_val)) < 1e-9
+        exp_int    = int(round(exp_val)) if exp_is_int else None
+        if exp_is_int and exp_int is not None and 2 <= exp_int <= 8:
+            cse_key = ("_pow_int", (base_id,), (("n", exp_int),))
+            if cse_key not in ctx.cse_cache:
+                acc = base_id
+                for _ in range(exp_int - 1):
+                    mul_key = ("mul", (acc, base_id), ())
+                    if mul_key not in ctx.cse_cache:
+                        ctx.cse_cache[mul_key] = ctx.graph.add(
+                            "mul", (acc, base_id), {}
+                        )
+                    acc = ctx.cse_cache[mul_key]
+                ctx.cse_cache[cse_key] = acc
+            return ctx.cse_cache[cse_key]
+
+        ctx.warnings.append(
+            f"x**{exp_val}: compiled as exp(log(x)·{exp_val}).  "
+            "Output will be NaN for any non-positive element of x.  "
+            "Prefer integer exponents 2–8 or ensure x > 0."
+        )
+        cse_key = ("_pow_float", (base_id,), (("e", exp_val),))
+        if cse_key not in ctx.cse_cache:
+            const_id = _compile_node(sp.Float(exp_val), ctx)
+            log_id   = ctx.graph.add("log", (base_id,), {})
+            mul_id   = ctx.graph.add("mul", (log_id, const_id), {})
+            exp_id   = ctx.graph.add("exp", (mul_id,), {})
+            ctx.cse_cache[cse_key] = exp_id
+        return ctx.cse_cache[cse_key]
 
     raise ValueError(
         f"Unsupported SymPy node {type(expr).__name__}: {expr}\n"
@@ -1005,7 +1118,7 @@ def compile_expression(
     dx:        float = 1.0,
     boundary:  str   = "neumann",
     field_map: Optional[Dict[str, Any]] = None,
-) -> Tuple[stenpy.Graph, str, List[str], Dict[str, str]]:
+) -> Tuple[stenpy.Graph, str, List[str], Dict[str, str], sp.Expr]:
     if field_map is None:
         field_map = {"f": torch.zeros(1, dtype=torch.float64)}
 
@@ -1022,11 +1135,12 @@ def compile_expression(
     ctx.src_id = ctx.field_map.get("f", next(iter(ctx.field_map.values())))
     sink_id    = _compile_node(sympy_expr, ctx)
 
-    return g, sink_id, ctx.warnings, dict(ctx.field_map)
+    return g, sink_id, ctx.warnings, dict(ctx.field_map), sympy_expr
 
 # ----------------------------------------------------------------------
 # HPC helpers
 # ----------------------------------------------------------------------
+
 def _tensor_gb(shape: Tuple) -> float:
     try:
         return math.prod(int(s) for s in shape) * 8 / 1024**3
@@ -1085,8 +1199,7 @@ def _select_device_hpc() -> torch.device:
     n_gpu = torch.cuda.device_count()
     if n_gpu == 0:
         return torch.device("cpu")
-    device_idx = local_rank % n_gpu
-    return torch.device(f"cuda:{device_idx}")
+    return torch.device(f"cuda:{local_rank % n_gpu}")
 
 def _select_boundary() -> str:
     opts = {"1": "neumann", "2": "dirichlet", "3": "periodic", "4": "reflect"}
@@ -1104,6 +1217,7 @@ def _select_boundary() -> str:
 # ----------------------------------------------------------------------
 # VRAM management
 # ----------------------------------------------------------------------
+
 def _flush_vram(device: torch.device, verbose: bool = True) -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         return
@@ -1149,6 +1263,7 @@ def _prompt_vram_flush(device: torch.device) -> None:
 # ----------------------------------------------------------------------
 # Multi-field domain merging
 # ----------------------------------------------------------------------
+
 def _merge_domain(
     spacings: Dict[str, Tuple[float, ...]],
     origins:  Dict[str, Tuple[float, ...]],
@@ -1164,16 +1279,18 @@ def _merge_domain(
         for d in range(ndims)
     )
     ends: List[List[float]] = []
-    for name, sp in spacings.items():
+    for name, sp_tuple in spacings.items():
         sh   = shapes.get(name, ())
-        n_sp = min(len(sp), len(sh), ndims)
-        ends.append([origins[name][d] + (sh[d] - 1) * sp[d] for d in range(n_sp)])
+        n_sp = min(len(sp_tuple), len(sh), ndims)
+        ends.append([origins[name][d] + (sh[d] - 1) * sp_tuple[d]
+                     for d in range(n_sp)])
     merged_end = tuple(min(e[d] for e in ends) for d in range(ndims))
     return dx, merged_origin, merged_end
 
 # ----------------------------------------------------------------------
 # GPU-saturating direct-HDF5 chunked executor
 # ----------------------------------------------------------------------
+
 _CHUNK_VRAM_FRACTION = 0.12
 _PIPELINE_DEPTH      = 2
 
@@ -1251,7 +1368,6 @@ def _hdf5_direct_chunked_run(
         if device.type == "cuda":
             print(f"  {_vram_bar(device)}")
 
-    # Probe: compile graph + discover output shape
     probe_rows = min(8, total_rows)
     probe_fmap: Dict[str, torch.Tensor] = dict(scalar_map)
     for name, ds in handles.items():
@@ -1263,7 +1379,7 @@ def _hdf5_direct_chunked_run(
     _nerd(f"probe: {probe_rows} rows, compiling expression …")
 
     t_compile_start = time.perf_counter()
-    pre_graph, pre_sink, warns, field_node_ids = compile_expression(
+    pre_graph, pre_sink, warns, field_node_ids, _sympy_expr = compile_expression(
         expr_str, dx=dx, boundary=boundary, field_map=probe_fmap
     )
     t_compile_end = time.perf_counter()
@@ -1284,14 +1400,14 @@ def _hdf5_direct_chunked_run(
         torch.cuda.empty_cache()
         _nerd(f"post-probe VRAM: {torch.cuda.memory_allocated(device)/1024**3:.3f} GB")
 
-    # Pre-allocate output HDF5
     out_full_shape = (total_rows,) + out_trailing
     out_f  = _h5py.File(out_path, "w")
     out_ds = out_f.create_dataset(
         "data",
         shape            = out_full_shape,
         dtype            = np.float64,
-        chunks           = (min(chunk_rows, total_rows),) + out_trailing if out_trailing else None,
+        chunks           = ((min(chunk_rows, total_rows),) + out_trailing
+                            if out_trailing else None),
         compression      = "gzip",
         compression_opts = 1,
     )
@@ -1365,7 +1481,6 @@ def _hdf5_direct_chunked_run(
 
             ci, row_start, row_end, chunk_np = item
 
-            # H2D transfer
             t_h2d_start = time.perf_counter()
             chunk_tensors: Dict[str, torch.Tensor] = {}
             for name, arr in chunk_np.items():
@@ -1378,7 +1493,6 @@ def _hdf5_direct_chunked_run(
                 torch.cuda.synchronize(device)
             chunk_h2d_times.append(time.perf_counter() - t_h2d_start)
 
-            # Inject chunk tensors into graph
             chunk_graph = pre_graph
             for name, tensor in chunk_tensors.items():
                 if name in field_node_ids:
@@ -1386,7 +1500,6 @@ def _hdf5_direct_chunked_run(
                         field_node_ids[name], tensor
                     )
 
-            # GPU compute
             t_compute_start = time.perf_counter()
             with torch.no_grad():
                 chunk_rt      = stenpy.Runtime(stenpy.MemoryManager(), device=str(device))
@@ -1397,7 +1510,6 @@ def _hdf5_direct_chunked_run(
 
             out_gpu = chunk_results.get(pre_sink)
 
-            # D2H transfer
             t_dh_start = time.perf_counter()
             out_cpu = (out_gpu.detach().cpu()
                        if isinstance(out_gpu, torch.Tensor)
@@ -1497,6 +1609,7 @@ def _hdf5_direct_chunked_run(
 # ----------------------------------------------------------------------
 # Pipeline executor
 # ----------------------------------------------------------------------
+
 @dataclass
 class RunResult:
     op_name:         str
@@ -1507,8 +1620,8 @@ class RunResult:
     shape_out:       Optional[Tuple]
     simplifications: List[str]
     node_count:      int
-    out_path:        Optional[str] = None
-    throughput_gbs:  float         = 0.0
+    out_path:        Optional[str]  = None
+    throughput_gbs:  float          = 0.0
     perf:            Optional[PerfStats] = None
 
 def _print_banner(title: str, width: int = 72) -> None:
@@ -1524,7 +1637,7 @@ def _load_field(path: str, device: torch.device,
         nbytes = f[key].size * 8
     mode   = "eager" if nbytes < 500 * 1024**2 else "lazy"
     loaded = stenpy.load_tensor(path, device=device, normalize=normalize,
-                             return_mode=mode, max_eager_gb=0.5)
+                                return_mode=mode, max_eager_gb=0.5)
     if isinstance(loaded, tuple) and len(loaded) == 3:
         return loaded
     return loaded, (1.0,) * loaded.ndim, (0.0,) * loaded.ndim
@@ -1610,7 +1723,7 @@ class Pipeline:
             print(f"  Device              : {self.device}")
             if self.device.type == "cuda":
                 print(f"  {_vram_bar(self.device)}")
-                p = torch.cuda.get_device_properties(self.device)
+                p  = torch.cuda.get_device_properties(self.device)
                 bw = _gpu_peak_bw_gbs(self.device)
                 if math.isnan(bw):
                     print(f"  GPU peak mem BW     : N/A (ROCm attributes missing)")
@@ -1619,7 +1732,7 @@ class Pipeline:
                     mem_bus   = getattr(p, 'memory_bus_width', None)
                     if mem_clock is not None and mem_bus is not None:
                         print(f"  GPU peak mem BW     : {bw:.0f} GB/s  "
-                            f"({mem_clock/1e6:.2f} GHz × {mem_bus}-bit DDR)")
+                              f"({mem_clock/1e6:.2f} GHz × {mem_bus}-bit DDR)")
                     else:
                         print(f"  GPU peak mem BW     : {bw:.0f} GB/s  (details missing)")
             print(f"  Output folder       : {self.out_dir}/")
@@ -1735,7 +1848,9 @@ class Pipeline:
         primary    = self.tensor
         is_lazy    = isinstance(primary, stenpy.LazyField)
 
+        # ------------------------------------------------------------------
         # LazyField (streaming) path
+        # ------------------------------------------------------------------
         if is_lazy:
             lazy_field_names = {
                 n for n, v in field_map.items() if isinstance(v, stenpy.LazyField)
@@ -1751,13 +1866,15 @@ class Pipeline:
                 and isinstance(v, torch.Tensor)
             }
 
+            sympy_expr_for_flops: Optional[sp.Expr] = None
+            warns: List[str] = []
             try:
                 probe_fm = dict(scalar_map_for_chunk)
                 for n, p in lazy_path_map.items():
                     ds, _ = _open_hdf5_field(p)
                     probe_fm[n] = torch.from_numpy(ds[:2].astype(np.float64))
                     ds.file.close()
-                _, _, warns, _ = compile_expression(
+                _, _, warns, _, sympy_expr_for_flops = compile_expression(
                     expr_str, dx=self.dx, boundary=boundary, field_map=probe_fm
                 )
                 if self.verbose and warns:
@@ -1792,6 +1909,10 @@ class Pipeline:
             elapsed_ms = stats["elapsed_s"] * 1e3
             tput       = stats["throughput_gbs"]
 
+            n_elem    = math.prod(int(s) for s in shape_out) if shape_out else 1
+            est_flops = (_ast_flops(sympy_expr_for_flops, n_elem)
+                         if sympy_expr_for_flops is not None else 0.0)
+
             if self.verbose:
                 elapsed_s = elapsed_ms / 1e3
                 print(f"\n  ✓ {elapsed_ms:.0f} ms ({elapsed_s:.1f} s)  │  {tput:.3f} GB/s")
@@ -1802,7 +1923,6 @@ class Pipeline:
                     print(f"  {_vram_bar(self.device)}")
                 print(f"  Saved → {out_path}")
 
-            est_flops = _estimate_flops(expr_str, shape_out, in_shape)
             perf = PerfStats(
                 expr_str        = expr_str,
                 mode            = "lazy",
@@ -1836,10 +1956,12 @@ class Pipeline:
                 perf=perf,
             )
 
+        # ------------------------------------------------------------------
         # Eager (in-VRAM) path
+        # ------------------------------------------------------------------
         t_compile_start = time.perf_counter()
         try:
-            graph, sink_id, warns, field_node_ids = compile_expression(
+            graph, sink_id, warns, field_node_ids, sympy_expr = compile_expression(
                 expr_str, dx=self.dx, boundary=boundary,
                 field_map={k: v for k, v in field_map.items()
                            if not k.startswith("__")},
@@ -1880,13 +2002,13 @@ class Pipeline:
                 if self.device.type == "cuda":
                     torch.cuda.synchronize()
 
-            t_compute = time.perf_counter() - t_compute_start
+            t_compute  = time.perf_counter() - t_compute_start
             elapsed_ms = (t_compile + t_compute) * 1e3
 
-            output     = results.get(sink_id)
-            shape_out  = tuple(output.shape) if isinstance(output, torch.Tensor) else None
-            out_gb     = _tensor_gb(shape_out) if shape_out else 0.0
-            tput       = out_gb / (t_compute) if t_compute > 1e-9 else 0.0
+            output    = results.get(sink_id)
+            shape_out = tuple(output.shape) if isinstance(output, torch.Tensor) else None
+            out_gb    = _tensor_gb(shape_out) if shape_out else 0.0
+            tput      = out_gb / t_compute if t_compute > 1e-9 else 0.0
 
             t_dh_start = time.perf_counter()
             if isinstance(output, torch.Tensor) and output.ndim >= 1:
@@ -1936,7 +2058,9 @@ class Pipeline:
                     print(f"  Scalar: {scalar_val:.6g}  → {out_path}")
             t_write = time.perf_counter() - t_write_start
 
-            est_flops = _estimate_flops(expr_str, shape_out, in_shape)
+            n_elem    = math.prod(int(s) for s in shape_out) if shape_out else 1
+            est_flops = _ast_flops(sympy_expr, n_elem)
+
             perf = PerfStats(
                 expr_str      = expr_str,
                 mode          = "eager",
@@ -1979,6 +2103,15 @@ class Pipeline:
 
         has_lazy = any(isinstance(v, stenpy.LazyField) for v in clean_map.values())
 
+        sweep_sympy_expr: Optional[sp.Expr] = None
+        try:
+            sweep_sympy_expr = parse_expression(
+                expr_str,
+                field_names=set(clean_map.keys()) | {uv.name},
+            )
+        except Exception:
+            pass
+
         if self.verbose:
             print(f"\n  Sweeping '{uv.name}' over {len(vals)} values …")
 
@@ -2020,7 +2153,9 @@ class Pipeline:
                         )
                         shape_out = tuple(stats["shape_out"])
                         in_shape  = tuple(next(iter(self.shapes.values())))
-                        est_flops = _estimate_flops(expr_str, shape_out, in_shape)
+                        n_elem    = math.prod(int(s) for s in shape_out) if shape_out else 1
+                        est_flops = (_ast_flops(sweep_sympy_expr, n_elem)
+                                     if sweep_sympy_expr is not None else 0.0)
                         perf = PerfStats(
                             expr_str        = expr_str,
                             mode            = "lazy",
@@ -2061,7 +2196,7 @@ class Pipeline:
                             torch.cuda.empty_cache()
 
                     else:
-                        g, sid, warns, _ = compile_expression(
+                        g, sid, warns, _, _se = compile_expression(
                             expr_str, dx=self.dx, boundary=boundary,
                             field_map=sweep_map,
                         )
@@ -2087,6 +2222,8 @@ class Pipeline:
                         self.rt.flush_vram()
 
                 bar.update(1)
+
+        uv.current = uv.start
 
         if results_list:
             if self.verbose:
@@ -2134,7 +2271,7 @@ class Pipeline:
         _rank0_print(f"  {'─'*3}  {'─'*col_w}  {'─'*9}  {'─'*6}  {'─'*20}")
         for i, r in enumerate(results_list, 1):
             shape = str(r.shape_out) if r.shape_out else "scalar"
-            expr  = r.expr_str[:col_w]
+            expr  = _truncate(r.expr_str, col_w)
             _rank0_print(f"  {i:<3}  {expr:<{col_w}}  "
                          f"{r.elapsed_ms:>9.0f}  {r.throughput_gbs:>6.3f}  {shape}")
         _rank0_print(f"\n  Total  : {total_ms:.0f} ms  ({total_s:.1f} s)")
@@ -2175,6 +2312,7 @@ class Pipeline:
                         "t_write_s":     r.perf.t_write,
                         "t_total_s":     r.perf.t_total,
                         "est_flops":     r.perf.est_flops,
+                        "est_flops_note": "AST-derived upper bound; CSE may reduce actual ops",
                         "tflops":        r.perf.tflops(),
                         "peak_vram_gb":  r.perf.peak_vram_gb,
                         "n_chunks":      r.perf.n_chunks,
@@ -2196,9 +2334,9 @@ class Pipeline:
         _flush_vram(self.device, verbose=self.verbose)
 
 # ----------------------------------------------------------------------
-# Interactive REPL                                                       
+# Interactive REPL
 # ----------------------------------------------------------------------
-  
+
 _OP_GROUPS: Dict[str, List[str]] = {
     "Arithmetic":    ["add", "sub", "mul", "div", "neg", "clamp"],
     "Elementwise":   ["exp", "log", "sqrt", "sin", "tanh"],
@@ -2274,7 +2412,7 @@ def _show_operators() -> None:
         print("  ║  {:<{}}║".format(uv_str, _W - 6))
     print("  ╚" + "═" * (_W - 4) + "╝")
 
-def _show_fields(pipeline: Pipeline) -> None:
+def _show_fields(pipeline: "Pipeline") -> None:
     if not pipeline.fields:
         print("  (no fields loaded yet)"); return
     print(f"\n  {'Name':<8}  {'Shape':<28}  {'GB':>7}  {'Mode':<12}  {'dx':>8}  Path")
@@ -2283,15 +2421,15 @@ def _show_fields(pipeline: Pipeline) -> None:
         shape  = tuple(tensor.shape) if hasattr(tensor, "shape") else ("?",)
         mode   = "lazy/stream" if isinstance(tensor, stenpy.LazyField) else "eager/VRAM"
         path   = pipeline.field_paths.get(name, "<runtime>")
-        sp     = pipeline.spacings.get(name, (float("nan"),))
-        dx_val = float(sp[0]) if sp else float("nan")
+        sp_tup = pipeline.spacings.get(name, (float("nan"),))
+        dx_val = float(sp_tup[0]) if sp_tup else float("nan")
         gb     = _tensor_gb(shape)
         print(f"  {name:<8}  {str(shape):<28}  {gb:>7.3f}  "
               f"{mode:<12}  {dx_val:>8.5g}  {path}")
     if _NERD and pipeline.device.type == "cuda":
         print(f"\n  VRAM  {_vram_bar(pipeline.device)}")
 
-def _hpc_status(pipeline: Pipeline) -> None:
+def _hpc_status(pipeline: "Pipeline") -> None:
     parts = [f"device={pipeline.device}", f"dx={pipeline.dx:.4g}",
              f"bc={pipeline.boundary}"]
     print("  HPC  " + "  |  ".join(parts))
@@ -2301,7 +2439,7 @@ def _hpc_status(pipeline: Pipeline) -> None:
         if not math.isnan(bw):
             print(f"  GPU peak mem BW : {bw:.0f} GB/s")
 
-def _smart_define_field(pipeline: Pipeline) -> None:
+def _smart_define_field(pipeline: "Pipeline") -> None:
     print()
     print("  Enter one of:")
     print("    field_name          (e.g.  g  or  pressure)")
@@ -2344,14 +2482,14 @@ def _smart_define_field(pipeline: Pipeline) -> None:
         tensor = pipeline.fields[name]
         shape  = tuple(tensor.shape) if hasattr(tensor, "shape") else ("?",)
         mode   = "lazy/streamed" if isinstance(tensor, stenpy.LazyField) else "eager/in-VRAM"
-        sp     = pipeline.spacings.get(name, (float("nan"),))
+        sp_tup = pipeline.spacings.get(name, (float("nan"),))
         gb     = _tensor_gb(shape)
         print(f"\n  ✓ Field '{name}' ready")
         print(f"  {'─'*40}")
         print(f"    shape     : {shape}")
         print(f"    size      : {gb:.3f} GB  (float64)")
         print(f"    mode      : {mode}")
-        print(f"    spacing   : {sp}")
+        print(f"    spacing   : {sp_tup}")
         print(f"    origin    : {pipeline.origins.get(name)}")
         if pipeline.device.type == "cuda":
             print(f"    {_vram_bar(pipeline.device)}")
@@ -2364,7 +2502,7 @@ def _smart_define_field(pipeline: Pipeline) -> None:
     except Exception as exc:
         print(f"  ✗ Could not load: {exc}")
 
-def _operate(pipeline: Pipeline) -> None:
+def _operate(pipeline: "Pipeline") -> None:
     if not pipeline.fields:
         print("\n  ✗ No fields loaded — use [1] to define a field first."); return
     print()
@@ -2403,7 +2541,7 @@ def _operate(pipeline: Pipeline) -> None:
             print(f"  ✗ Error: {exc}")
     _prompt_vram_flush(pipeline.device)
 
-def _settings(pipeline: Pipeline) -> None:
+def _settings(pipeline: "Pipeline") -> None:
     print(f"\n  ┌─── HPC Settings ────────────────────────────────────────────")
     print(f"  │  dx        : {pipeline.dx:.6g}")
     print(f"  │  boundary  : {pipeline.boundary}")
@@ -2461,7 +2599,7 @@ def _settings(pipeline: Pipeline) -> None:
             torch.cuda.reset_peak_memory_stats(pipeline.device)
             print("  ○  Peak VRAM counter reset.")
 
-def _repl(pipeline: Pipeline) -> None:
+def _repl(pipeline: "Pipeline") -> None:
     print()
     print("═" * _W)
     print("  ops.py  │  HPC Field Pipeline  │  Interactive Mode")
@@ -2565,7 +2703,7 @@ def _create_demo_field(path: str = "demo_field.h5",
 # ----------------------------------------------------------------------
 # CLI entry point
 # ----------------------------------------------------------------------
-                         
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="main.py",
