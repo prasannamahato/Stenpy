@@ -350,16 +350,10 @@ def _gpu_peak_bw_gbs(device: torch.device) -> float:
     if device.type != "cuda" or not torch.cuda.is_available():
         return float("nan")
     props = torch.cuda.get_device_properties(device)
-    if hasattr(props, 'memory_clock_rate'):
-        mem_clock_khz = props.memory_clock_rate
-    elif hasattr(props, 'clock_rate'):
-        mem_clock_khz = props.clock_rate
-    else:
+    if not hasattr(props, 'memory_clock_rate') or not hasattr(props, 'memory_bus_width'):
         return float("nan")
-    if hasattr(props, 'memory_bus_width'):
-        bus_width_bits = props.memory_bus_width
-    else:
-        return float("nan")
+    mem_clock_khz = props.memory_clock_rate
+    bus_width_bits = props.memory_bus_width
     return (2.0 * mem_clock_khz * 1e3 * (bus_width_bits / 8)) / 1e9
 
 def _gpu_name(device: torch.device) -> str:
@@ -1072,44 +1066,39 @@ def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
         base_id = _compile_node(expr.args[0], ctx)
         exp_val = float(expr.args[1])
 
-        if abs(exp_val - 1.0) < 1e-9:
-            return base_id
-
         if abs(exp_val - 0.5) < 1e-9:
             cse_key = ("sqrt", (base_id,), ())
-            if cse_key not in ctx.cse_cache:
-                ctx.cse_cache[cse_key] = ctx.graph.add("sqrt", (base_id,), {})
-            return ctx.cse_cache[cse_key]
+            if cse_key in ctx.cse_cache:
+                return ctx.cse_cache[cse_key]
+            nid = ctx.graph.add("sqrt", (base_id,), {})
+            ctx.cse_cache[cse_key] = nid
+            return nid
 
-        exp_is_int = abs(exp_val - round(exp_val)) < 1e-9
-        exp_int    = int(round(exp_val)) if exp_is_int else None
-        if exp_is_int and exp_int is not None and 2 <= exp_int <= 8:
-            cse_key = ("_pow_int", (base_id,), (("n", exp_int),))
-            if cse_key not in ctx.cse_cache:
-                acc = base_id
-                for _ in range(exp_int - 1):
-                    mul_key = ("mul", (acc, base_id), ())
-                    if mul_key not in ctx.cse_cache:
-                        ctx.cse_cache[mul_key] = ctx.graph.add(
-                            "mul", (acc, base_id), {}
-                        )
-                    acc = ctx.cse_cache[mul_key]
-                ctx.cse_cache[cse_key] = acc
-            return ctx.cse_cache[cse_key]
+        n = int(exp_val)
+        if abs(exp_val - n) < 1e-9 and abs(n) <= 16:
+            if n == 0:
+                one = ctx.graph.add("_constant", (),
+                                    {"value": torch.tensor(1.0, dtype=torch.float64)})
+                return one
+            if n < 0:
+                pos_id = _compile_node(sp.Pow(expr.args[0], sp.Integer(-n)), ctx)
+                one = ctx.graph.add("_constant", (),
+                                    {"value": torch.tensor(1.0, dtype=torch.float64)})
+                return ctx.graph.add("div", (one, pos_id), {})
+            result_id = base_id
+            for _ in range(n - 1):
+                cse_key = ("mul", (result_id, base_id), ())
+                if cse_key in ctx.cse_cache:
+                    result_id = ctx.cse_cache[cse_key]
+                else:
+                    result_id = ctx.graph.add("mul", (result_id, base_id), {})
+                    ctx.cse_cache[cse_key] = result_id
+            return result_id
 
-        ctx.warnings.append(
-            f"x**{exp_val}: compiled as exp(log(x)·{exp_val}).  "
-            "Output will be NaN for any non-positive element of x.  "
-            "Prefer integer exponents 2–8 or ensure x > 0."
-        )
-        cse_key = ("_pow_float", (base_id,), (("e", exp_val),))
-        if cse_key not in ctx.cse_cache:
-            const_id = _compile_node(sp.Float(exp_val), ctx)
-            log_id   = ctx.graph.add("log", (base_id,), {})
-            mul_id   = ctx.graph.add("mul", (log_id, const_id), {})
-            exp_id   = ctx.graph.add("exp", (mul_id,), {})
-            ctx.cse_cache[cse_key] = exp_id
-        return ctx.cse_cache[cse_key]
+        log_id = ctx.graph.add("log", (base_id,), {})
+        const_nid = _compile_node(sp.Float(exp_val), ctx)
+        mul_id = ctx.graph.add("mul", (log_id, const_nid), {})
+        return ctx.graph.add("exp", (mul_id,), {})
 
     raise ValueError(
         f"Unsupported SymPy node {type(expr).__name__}: {expr}\n"
@@ -2115,15 +2104,20 @@ class Pipeline:
         except Exception:
             pass
 
+        compiled_graph: Optional[stenpy.Graph] = None
+        compiled_sink:  Optional[str]          = None
+        compiled_warns: List[str]              = []
+        compiled_fnids: Dict[str, str]         = {}
+
         if self.verbose:
             print(f"\n  Sweeping '{uv.name}' over {len(vals)} values …")
 
         with _make_bar(len(vals), desc=f"Sweep {uv.name}", unit="step",
-                       colour="green") as bar:
+                    colour="green") as bar:
             for v in vals:
                 uv.current = float(v)
                 sweep_map  = {**clean_map,
-                              uv.name: torch.tensor(uv.current, dtype=torch.float64)}
+                            uv.name: torch.tensor(uv.current, dtype=torch.float64)}
 
                 fname   = _expr_to_filename(f"{expr_str}_{uv.name}{v:.4g}",
                                             self.src_stem)
@@ -2158,7 +2152,7 @@ class Pipeline:
                         in_shape  = tuple(next(iter(self.shapes.values())))
                         n_elem    = math.prod(int(s) for s in shape_out) if shape_out else 1
                         est_flops = (_ast_flops(sweep_sympy_expr, n_elem)
-                                     if sweep_sympy_expr is not None else 0.0)
+                                    if sweep_sympy_expr is not None else 0.0)
                         perf = PerfStats(
                             expr_str        = expr_str,
                             mode            = "lazy",
@@ -2193,33 +2187,43 @@ class Pipeline:
                         ))
                         if self.verbose:
                             print(f"  {uv.name}={v:.4g}  →  {op_path}"
-                                  f"  ({stats['elapsed_s']:.1f}s  "
-                                  f"{stats['throughput_gbs']:.3f} GB/s)")
+                                f"  ({stats['elapsed_s']:.1f}s  "
+                                f"{stats['throughput_gbs']:.3f} GB/s)")
                         if self.device.type == "cuda":
                             torch.cuda.empty_cache()
 
                     else:
-                        g, sid, warns, _, _se = compile_expression(
-                            expr_str, dx=self.dx, boundary=boundary,
-                            field_map=sweep_map,
-                        )
+                        if compiled_graph is None:
+                            compiled_graph, compiled_sink, compiled_warns, compiled_fnids, _ = compile_expression(
+                                expr_str, dx=self.dx, boundary=boundary,
+                                field_map=sweep_map,
+                            )
+                        else:
+                            scalar_node_id = compiled_fnids.get(uv.name)
+                            if scalar_node_id is not None:
+                                compiled_graph = compiled_graph.clone_with_replacement(
+                                    scalar_node_id,
+                                    torch.tensor(uv.current, dtype=torch.float64),
+                                )
+
                         with torch.no_grad():
-                            res = self.rt.run(g)
+                            res = self.rt.run(compiled_graph)
                         if self.device.type == "cuda":
                             torch.cuda.synchronize()
-                        out = res.get(sid)
+                        out = res.get(compiled_sink)
                         if isinstance(out, torch.Tensor) and out.ndim >= 1:
                             stenpy.save_tensor(out, self.spacing, self.origin, op_path)
                         results_list.append(RunResult(
                             op_name=expr_str, expr_str=expr_str, output=out,
                             elapsed_ms=0, shape_in=(),
                             shape_out=tuple(out.shape) if isinstance(out, torch.Tensor) else None,
-                            simplifications=warns, node_count=len(g),
+                            simplifications=compiled_warns, node_count=len(compiled_graph),
                             out_path=op_path,
                         ))
 
                 except Exception as exc:
                     _rank0_print(f"\n  ✗ {uv.name}={v:.4g}  {exc}")
+                    compiled_graph = None
                 finally:
                     if not has_lazy:
                         self.rt.flush_vram()
