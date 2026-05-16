@@ -1,4 +1,4 @@
-# stenpy.py
+#sten.py
 
 from __future__ import annotations
 
@@ -79,12 +79,6 @@ def _vram_free_bytes(device: torch.device) -> int:
 # -----------------------------------------------------------------------------
 
 class _PinnedStagingPool:
-    """Reusable page-locked CPU buffers for async H2D transfers.
-
-    Buffers are allocated in float64 elements (not bytes) to guarantee
-    that .view(torch.float64) is always valid — a uint8 buffer whose
-    byte-length is not a multiple of 8 would raise a RuntimeError.
-    """
 
     def __init__(self, max_buffers: int = 4) -> None:
         self._lock = threading.Lock()
@@ -95,15 +89,14 @@ class _PinnedStagingPool:
     def get(self, nbytes: int) -> Optional[torch.Tensor]:
         if not self._enabled:
             return None
-        n_elems = math.ceil(nbytes / 8)
         with self._lock:
             for i, buf in enumerate(self._free):
-                if buf.numel() >= n_elems:
+                if buf.numel() >= nbytes:
                     self._free.pop(i)
-                    return buf[:n_elems]
-        rounded = 1 << (n_elems - 1).bit_length() if n_elems > 0 else 1
+                    return buf[:nbytes]
+        rounded = 1 << (nbytes - 1).bit_length() if nbytes > 0 else 1
         try:
-            return torch.empty(rounded, dtype=torch.float64, pin_memory=True)[:n_elems]
+            return torch.empty(rounded, dtype=torch.uint8, pin_memory=True)[:nbytes]
         except Exception:
             return None
 
@@ -131,9 +124,9 @@ def _lazy_to_gpu(
     nbytes = arr.nbytes
     pinned = _PINNED_POOL.get(nbytes)
     if pinned is not None:
-        pinned_np = pinned.numpy().view(np.uint8)[:nbytes]
+        pinned_np = pinned.numpy()
         np.copyto(pinned_np, arr.ravel().view(np.uint8))
-        src = pinned[:arr.size].view(torch.float64).reshape(arr.shape)
+        src = pinned.view(torch.float64).reshape(arr.shape)
         ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         with ctx:
             gpu_t = src.to(device, non_blocking=True)
@@ -200,7 +193,6 @@ class Field:
 
 
 class MemoryManager:
-    """Pooled tensor allocator with VRAM headroom checks."""
 
     _DEFAULT_POOL_DEPTH = int(os.environ.get("OPS_POOL_DEPTH", "4"))
 
@@ -220,7 +212,7 @@ class MemoryManager:
         return (shape, str(device), layout)
 
     def _tag(self, t: torch.Tensor, key: str) -> None:
-        t._mm_key = key  
+        t._mm_key = key
 
     def allocate(
         self,
@@ -246,9 +238,9 @@ class MemoryManager:
                 t.zero_()
             else:
                 t = torch.zeros(shape, dtype=_DTYPE, device=device).to(memory_format=layout)
-            k = key or _uid("alloc")
-            self._live[k] = t
-            self._tag(t, k)
+            if key:
+                self._live[key] = t
+                self._tag(t, key)
         return t
 
     def release(self, tensor: torch.Tensor, key: Optional[str] = None) -> None:
@@ -257,10 +249,8 @@ class MemoryManager:
         with self._lock:
             if key is not None:
                 self._live.pop(key, None)
-            mm_key = getattr(tensor, "_mm_key", None)
-            if mm_key is None:
+            if not hasattr(tensor, "_mm_key"):
                 return
-            self._live.pop(mm_key, None)
             if not tensor.is_contiguous():
                 return
             if tensor.requires_grad or tensor.grad_fn is not None:
@@ -277,16 +267,6 @@ class MemoryManager:
             while len(pool) > self._pool_depth * 2:
                 old = pool.pop(0)
                 ptrs.discard(old.data_ptr())
-
-    def _clear_pool_unlocked(self) -> None:
-        """Internal pool clear; caller must NOT hold self._lock."""
-        self._pool.clear()
-        self._pool_ptrs.clear()
-
-    def clear_pool(self) -> None:
-        """Public pool clear; safe to call from outside flush_vram."""
-        with self._lock:
-            self._clear_pool_unlocked()
 
     def should_manage(self, shape: Tuple[int, ...]) -> bool:
         return math.prod(shape) >= 1024
@@ -318,6 +298,11 @@ class MemoryManager:
         t = self.allocate(shape, device, key=k, layout=layout)
         return Field(tensor=t, spacing=spacing, origin=origin, mm=self, key=k)
 
+    def clear_pool(self) -> None:
+        with self._lock:
+            self._pool.clear()
+            self._pool_ptrs.clear()
+
     def halo_exchange(self, shard: torch.Tensor, radius: int, dims: Optional[List[int]] = None) -> torch.Tensor:
         return shard
 
@@ -346,36 +331,12 @@ class MemoryManager:
         return f"MemoryManager(live={n_live}, pooled={n_pool})"
 
 
-class MemoryManagerFactory:
-    _cls: type = MemoryManager
-
-    @classmethod
-    def set(cls, mm_class: type) -> None:
-        if not issubclass(mm_class, MemoryManager):
-            raise TypeError(f"mm_class must subclass MemoryManager, got {mm_class}")
-        cls._cls = mm_class
-
-    @classmethod
-    def build(cls, *args, **kwargs) -> MemoryManager:
-        return cls._cls(*args, **kwargs)
-
-    @classmethod
-    def reset(cls) -> None:
-        cls._cls = MemoryManager
-
-
 def use_advanced_mm() -> None:
-    """Load memory_manager.MemoryManager and register it with MemoryManagerFactory.
-
-    Previously this monkey-patched the module global, which silently left any
-    already-imported reference pointing at the old class.  Now it registers the
-    advanced class with MemoryManagerFactory; new Runtime instances will use it
-    automatically, and existing instances are unaffected (which is correct).
-    """
+    global MemoryManager
     try:
-        from memory_manager import MemoryManager as _AdvMM 
-        MemoryManagerFactory.set(_AdvMM)
-        _dbg("use_advanced_mm: registered advanced MemoryManager via MemoryManagerFactory")
+        from memory_manager import MemoryManager as _AdvMM
+        MemoryManager = _AdvMM
+        _dbg("Switched to advanced MemoryManager from memory_manager.py")
     except ImportError as exc:
         warnings.warn(f"memory_manager.py not found; staying with built-in pool ({exc})")
 
@@ -419,14 +380,11 @@ class Graph:
         in_deg: Dict[str, int] = {nid: 0 for nid in self._nodes}
         children: Dict[str, List[str]] = {nid: [] for nid in self._nodes}
         for nid, node in self._nodes.items():
-            seen_deps: set = set()
             for dep in node.input_ids:
                 if dep not in self._nodes:
                     raise ValueError(f"Node '{nid}' references unknown input '{dep}'")
-                if dep not in seen_deps:
-                    in_deg[nid] += 1
-                    children[dep].append(nid)
-                    seen_deps.add(dep)
+                in_deg[nid] += 1
+                children[dep].append(nid)
         queue = collections.deque(nid for nid, d in in_deg.items() if d == 0)
         order: List[GraphNode] = []
         while queue:
@@ -467,26 +425,11 @@ def _validate_halo_contract(tensor: torch.Tensor, radius: int, dims: Optional[Li
             raise ValueError(f"{op_name}: dim {d} size {tensor.shape[d]} too small for halo radius {radius}")
 
 
-@dataclass
-class _OpSigFlags:
-    has_alloc: bool
-    has_mm: bool
-
-
-_OP_SIG_CACHE: Dict[str, _OpSigFlags] = {}
-
-
-def _op_sig_flags(op_name: str, fn: Callable) -> _OpSigFlags:
-    if op_name not in _OP_SIG_CACHE:
-        try:
-            params = inspect.signature(fn).parameters
-        except (ValueError, TypeError):
-            params = {}
-        _OP_SIG_CACHE[op_name] = _OpSigFlags(
-            has_alloc="alloc" in params,
-            has_mm="mm" in params,
-        )
-    return _OP_SIG_CACHE[op_name]
+def _op_accepts_alloc(fn: Callable) -> bool:
+    try:
+        return "alloc" in inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
 
 
 class Runtime:
@@ -494,11 +437,17 @@ class Runtime:
         self.mm = mm
         _set_dist_mm(mm)
         self.device = torch.device(device)
+        self._alloc_cache: Dict[str, bool] = {}
         self._h2d_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(self.device)
             if self.device.type == "cuda" and torch.cuda.is_available()
             else None
         )
+
+    def _accepts_alloc(self, op_name: str, fn: Callable) -> bool:
+        if op_name not in self._alloc_cache:
+            self._alloc_cache[op_name] = _op_accepts_alloc(fn)
+        return self._alloc_cache[op_name]
 
     def _ref_counts(self, graph: Graph) -> Dict[str, int]:
         counts: Dict[str, int] = {nid: 0 for nid in graph._nodes}
@@ -508,23 +457,13 @@ class Runtime:
         return counts
 
     def flush_vram(self) -> None:
-        """Flush VRAM: evict live tensors, drain the pool, and call empty_cache.
-
-        Previously this held self.mm._lock while calling clear_pool(), which
-        also acquires the same non-reentrant lock → guaranteed deadlock.
-        Fixed by collecting the keys under the lock, releasing the lock, then
-        calling clear_pool() (which takes the lock itself) separately.
-        """
         with self.mm._lock:
-            dead_keys = [
-                k for k, t in self.mm._live.items()
-                if isinstance(t, torch.Tensor) and t.device.type == "cuda"
-            ]
+            dead_keys = [k for k, t in self.mm._live.items() if isinstance(t, torch.Tensor) and t.device.type == "cuda"]
             for k in dead_keys:
                 t = self.mm._live.pop(k)
                 del t
-            self.mm._clear_pool_unlocked()
-
+            self.mm._pool_ptrs.clear()
+        self.mm.clear_pool()
         _PINNED_POOL.clear()
         if self.device.type == "cuda" and torch.cuda.is_available():
             _clear_k_grid_cache()
@@ -541,10 +480,11 @@ class Runtime:
             torch.cuda.synchronize(self.device)
             free = _vram_free_bytes(self.device)
             usable = int(free * (1.0 - _VRAM_HEADROOM_FRAC * 2))
-        elif _HAS_PSUTIL:
-            usable = int(_psutil.virtual_memory().available * 0.30)
         else:
-            usable = 1 * 1024**3
+            try:
+                usable = int(_psutil.virtual_memory().available * 0.30)
+            except Exception:
+                usable = 1 * 1024**3
         chunk = max(1, int(usable / (safety_factor * bytes_per_slice)))
         result = min(chunk, shape[chunk_dim])
         _dbg(f"_auto_chunk_size: free={usable/1024**3:.2f}GB bytes/slice={bytes_per_slice/1024**2:.1f}MB chunk={result}")
@@ -580,18 +520,19 @@ class Runtime:
         if chunk_size is None:
             chunk_size = self._auto_chunk_size(lazy_field, chunk_dim)
 
-        n_chunks = math.ceil(total / chunk_size)  
-        with torch.no_grad():
-            idx0: List[Any] = [slice(None)] * len(lazy_field.shape)
-            idx0[chunk_dim] = slice(0, min(chunk_size, total))
-            arr0 = lazy_field[tuple(idx0)]
-            t0 = torch.from_numpy(arr0.astype(np.float64)).to(_DTYPE).to(self.device)
-            g0 = graph
-            for nid in lazy_node_ids:
-                g0 = g0.clone_with_replacement(nid, t0)
-            r0 = self.run(g0)
-            c0 = r0[sink_id].cpu()
+        n_chunks = math.ceil(total / chunk_size)
 
+        # probe first chunk for output shape
+        idx0: List[Any] = [slice(None)] * len(lazy_field.shape)
+        idx0[chunk_dim] = slice(0, min(chunk_size, total))
+        arr0 = lazy_field[tuple(idx0)]
+        t0 = torch.from_numpy(arr0.astype(np.float64)).to(_DTYPE).to(self.device)
+        g0 = graph
+        for nid in lazy_node_ids:
+            g0 = g0.clone_with_replacement(nid, t0)
+        with torch.no_grad():
+            r0 = self.run(g0)
+        c0 = r0[sink_id].cpu()
         out_shape = list(c0.shape)
         out_shape[chunk_dim] = total
         out_shape = tuple(out_shape)
@@ -603,6 +544,7 @@ class Runtime:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+        # HDF5 output
         h5f = h5_dset = None
         write_dim = chunk_dim
         if out_path is not None:
@@ -645,14 +587,12 @@ class Runtime:
         PREFETCH_SIZE = 1
         prefetch_q: _queue.Queue = _queue.Queue(maxsize=PREFETCH_SIZE)
 
-        _lf = lazy_field
-
         def _reader_thread(starts: List[int]) -> None:
             for st in starts:
                 en = min(st + chunk_size, total)
-                idxr = [slice(None)] * len(_lf.shape)
+                idxr = [slice(None)] * len(lazy_field.shape)
                 idxr[chunk_dim] = slice(st, en)
-                arr = _lf[tuple(idxr)]
+                arr = lazy_field[tuple(idxr)]
                 prefetch_q.put((st, en, arr))
             prefetch_q.put(None)
 
@@ -775,10 +715,11 @@ class Runtime:
                 inputs = [self.mm.halo_exchange(i, radius, dims) if isinstance(i, torch.Tensor) else i for i in inputs]
 
             op_fn = OP_REGISTRY[node.op_name]
-            flags = _op_sig_flags(node.op_name, op_fn)
-            if flags.has_alloc:
+            sig = inspect.signature(op_fn)
+            params = sig.parameters
+            if "alloc" in params:
                 kwargs["alloc"] = self.mm.allocate
-            if flags.has_mm:
+            if "mm" in params:
                 kwargs["mm"] = self.mm
 
             output = op_fn(*inputs, **kwargs)
@@ -902,7 +843,6 @@ def register_operator(
         "cost": cost,
         "exchange_dims": exchange_dims,
     }
-    _OP_SIG_CACHE.pop(name, None)
 
 
 # -----------------------------------------------------------------------------
@@ -954,45 +894,14 @@ def mul(a: torch.Tensor, b: torch.Tensor, alloc=None) -> torch.Tensor:
 register_operator("mul", mul, cost="low")
 
 
-def div(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    eps: float = 0.0,
-    safe_clamp: bool = False,
-    alloc=None,
-) -> torch.Tensor:
-    """Element-wise division a / b.
-
-    Parameters
-    ----------
-    eps:
-        Only used when ``safe_clamp=True``.  The old API silently clamped *b*
-        to this value for every call, corrupting near-zero physics values
-        without any warning.  The default is now 0.0 (no clamping).
-    safe_clamp:
-        When True, clamp *b* to ``max(|b|, eps)`` before dividing and emit a
-        warning so callers are aware that values have been modified.  Use this
-        only when you explicitly want to guard against division-by-zero and
-        accept the approximation.
-    """
+def div(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-15, alloc=None) -> torch.Tensor:
     _assert_fp64(a, "div(a)")
     _assert_fp64(b, "div(b)")
-    if safe_clamp:
-        if eps <= 0.0:
-            raise ValueError("div: safe_clamp=True requires eps > 0")
-        n_clamped = int((b.abs() < eps).sum().item())
-        if n_clamped:
-            warnings.warn(
-                f"div: safe_clamp replaced {n_clamped} value(s) with eps={eps:.2e}. "
-                "Set safe_clamp=False to preserve exact values.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        b = b.abs().clamp(min=eps) * b.sign().where(b != 0, torch.ones_like(b))
+    b_safe = b.clamp(min=eps)
     if alloc is None:
-        return torch.div(a, b)
+        return torch.div(a, b_safe)
     out = alloc(torch.broadcast_shapes(a.shape, b.shape), a.device, key=_uid("div"))
-    return torch.div(a, b, out=out)
+    return torch.div(a, b_safe, out=out)
 
 
 register_operator("div", div, cost="low")
@@ -1204,9 +1113,6 @@ def laplacian_3d_kernel(
     tl.store(out_ptr + idx(off_x, off_y, off_z), lap, mask=mask)
 
 
-_TRITON_BLOCK = 4
-
-
 class Laplacian:
     def __init__(self, boundary: str = "periodic") -> None:
         self.boundary = boundary
@@ -1223,8 +1129,20 @@ class Laplacian:
         D = x.ndim
         dv = self._normalize_dx(dx, D, x.device, x.dtype)
 
-        if x.is_cuda and D == 3:
-            return self._call_triton_3d(x, dv)
+        if not x.is_cuda:
+            out = torch.zeros_like(x)
+            for d in range(D):
+                xp = torch.roll(x, shifts=-1, dims=d)
+                xm = torch.roll(x, shifts=1, dims=d)
+                if self.boundary != "periodic":
+                    slc0 = [slice(None)] * D
+                    slc0[d] = 0
+                    slc1 = [slice(None)] * D
+                    slc1[d] = -1
+                    xp[tuple(slc1)] = x[tuple(slc1)]
+                    xm[tuple(slc0)] = x[tuple(slc0)]
+                out.add_((xp + xm - 2.0 * x) / (dv[d] * dv[d]))
+            return out
 
         out = torch.zeros_like(x)
         for d in range(D):
@@ -1238,30 +1156,6 @@ class Laplacian:
                 xp[tuple(slc1)] = x[tuple(slc1)]
                 xm[tuple(slc0)] = x[tuple(slc0)]
             out.add_((xp + xm - 2.0 * x) / (dv[d] * dv[d]))
-        return out
-
-    def _call_triton_3d(self, x: torch.Tensor, dv: torch.Tensor) -> torch.Tensor:
-        """Dispatch laplacian_3d_kernel for a contiguous 3-D CUDA tensor."""
-        x_c = x.contiguous()
-        out = torch.empty_like(x_c)
-        nx, ny, nz = x_c.shape
-        dx2 = float(dv[0] ** 2)
-        dy2 = float(dv[1] ** 2)
-        dz2 = float(dv[2] ** 2)
-        periodic = 1 if self.boundary == "periodic" else 0
-        B = _TRITON_BLOCK
-        grid = (
-            math.ceil(nx / B),
-            math.ceil(ny / B),
-            math.ceil(nz / B),
-        )
-        laplacian_3d_kernel[grid](
-            x_c, out,
-            nx, ny, nz,
-            dx2, dy2, dz2,
-            periodic,
-            BLOCK_X=B, BLOCK_Y=B, BLOCK_Z=B,
-        )
         return out
 
 
@@ -1594,7 +1488,7 @@ register_operator("deviatoric", deviatoric, cost="medium")
 
 
 # -----------------------------------------------------------------------------
-# Spectral k-grid cache
+# Spectral k‑grid cache
 # -----------------------------------------------------------------------------
 
 @dataclass
@@ -1630,52 +1524,25 @@ def _k_grid(shape: Tuple[int, ...], spacing: Tuple[float, ...], device: torch.de
 
 
 def spectral_gradient(t: torch.Tensor, dx: Union[float, Tuple[float, ...]] = 1.0, dim: int = 0, alloc=None) -> torch.Tensor:
-    """Spectral (Fourier) gradient along *dim*.
-
-    Uses rfftn/irfftn for real-valued float64 input so that the output is
-    guaranteed real without discarding a non-trivial imaginary part.  fftn
-    of a real input produces a Hermitian spectrum, so the imaginary residual
-    after ifftn is only floating-point noise — but using the real-to-complex
-    pair is both faster and semantically correct.
-    """
     _assert_fp64(t, "spectral_gradient")
     ndim = t.ndim
     dxs = (dx,) * ndim if isinstance(dx, float) else tuple(dx)
     entry = _k_grid(t.shape, dxs, t.device)
-    T_hat = torch.fft.rfftn(t)
-    ik = entry.grids[dim]
-    if dim == ndim - 1:
-        n_last = t.shape[-1] // 2 + 1
-        sh = [1] * ndim
-        sh[dim] = n_last
-        ik = torch.fft.fftfreq(t.shape[dim], d=dxs[dim], device=t.device).to(_DTYPE)[:n_last] * (2 * math.pi)
-        ik = ik.view(sh)
-    dT_hat = 1j * ik * T_hat
-    return torch.fft.irfftn(dT_hat, s=t.shape).to(_DTYPE)
+    T_hat = torch.fft.fftn(t)
+    dT_hat = 1j * entry.grids[dim] * T_hat
+    return torch.fft.ifftn(dT_hat).real.to(_DTYPE)
 
 
 register_operator("spectral_gradient", spectral_gradient, cost="high")
 
 
 def spectral_laplacian(t: torch.Tensor, dx: Union[float, Tuple[float, ...]] = 1.0, alloc=None) -> torch.Tensor:
-    """Spectral (Fourier) Laplacian.
-
-    Uses rfftn/irfftn for real-valued float64 input; see spectral_gradient
-    for the rationale.
-    """
     _assert_fp64(t, "spectral_laplacian")
     ndim = t.ndim
     dxs = (dx,) * ndim if isinstance(dx, float) else tuple(dx)
     entry = _k_grid(t.shape, dxs, t.device)
-    T_hat = torch.fft.rfftn(t)
-    grids_r = list(entry.grids)
-    n_last = t.shape[-1] // 2 + 1
-    sh_last = [1] * ndim
-    sh_last[-1] = n_last
-    k_last = torch.fft.rfftfreq(t.shape[-1], d=dxs[-1], device=t.device).to(_DTYPE) * (2 * math.pi)
-    grids_r[-1] = k_last.view(sh_last)
-    k2_r = sum(kg**2 for kg in grids_r)
-    return torch.fft.irfftn(-k2_r * T_hat, s=t.shape).to(_DTYPE)
+    T_hat = torch.fft.fftn(t)
+    return torch.fft.ifftn(-entry.k2 * T_hat).real.to(_DTYPE)
 
 
 register_operator("spectral_laplacian", spectral_laplacian, cost="high")
@@ -1759,7 +1626,6 @@ _SPACING_HINTS = [
 
 
 class LazyField:
-    """Lazy HDF5 dataset wrapper – loads only when sliced."""
 
     def __init__(self, path: str, dataset_name: str = "field") -> None:
         self.path = path
@@ -2109,7 +1975,7 @@ class _DistMemoryManager(MemoryManager):
 
 
 if dist.is_available():
-    MemoryManagerFactory.set(_DistMemoryManager)
+    MemoryManager = _DistMemoryManager
 
 
 def decompose_field(field: Field, dim: int = 0, overlap: int = 0) -> Tuple[Field, Tuple, Tuple[int, int]]:
@@ -2186,7 +2052,7 @@ def _execute_serial(
 ) -> None:
     if op_name not in OP_REGISTRY:
         raise ValueError(f"Unknown operator '{op_name}' (known: {list(OP_REGISTRY)})")
-    mm = MemoryManagerFactory.build()
+    mm = MemoryManager()
     rt = Runtime(mm, device=device)
     dev = torch.device(device)
     raw_t, spacing, origin = load_tensor(input_path, device=dev, normalize=normalize)
@@ -2232,7 +2098,7 @@ def execute_dist(
         return _execute_serial(op_name, input_path, out_path, device, tile_shape, normalize, dx, boundary, **params)
     raw_t, spacing, origin = load_tensor_parallel(input_path, device=device, normalize=normalize)
     _assert_fp64(raw_t, "execute_dist/load")
-    mm = MemoryManagerFactory.build()
+    mm = MemoryManager()
     rt = Runtime(mm, device=device)
     dev = torch.device(device)
     key_in = _uid("input")
@@ -2325,7 +2191,6 @@ def validate_operator_identity() -> None:
 __all__ = [
     "Field",
     "MemoryManager",
-    "MemoryManagerFactory",
     "Graph",
     "Runtime",
     "register_operator",
