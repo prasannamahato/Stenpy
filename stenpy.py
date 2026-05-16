@@ -1,4 +1,4 @@
-#sten.py
+#stenpy.py
 
 from __future__ import annotations
 
