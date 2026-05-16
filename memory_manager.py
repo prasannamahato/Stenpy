@@ -1,6 +1,7 @@
+# memory_manager.py
+
 from __future__ import annotations
 
-import hashlib
 import heapq
 import math
 import os
@@ -11,7 +12,6 @@ import time
 import uuid
 import warnings
 from collections import OrderedDict, deque
-from concurrent.futures import Future, ThreadPoolExecutor  
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -44,6 +44,7 @@ else:
 # ----------------------------------------------------------------------
 # HDF5 compression backend: prefer LZ4, fallback to Zstd-1, then gzip-1
 # ----------------------------------------------------------------------
+
 try:
     import hdf5plugin as _hdf5plugin
     _COMPRESS_KWARGS = dict(**_hdf5plugin.LZ4())
@@ -60,6 +61,7 @@ except Exception:
 # ----------------------------------------------------------------------
 # Configuration from environment
 # ----------------------------------------------------------------------
+
 CPU_PRESSURE_HIGH = float(os.environ.get("OPS_MM_CPU_PRESSURE_HIGH", "0.75"))
 CPU_PRESSURE_LOW  = float(os.environ.get("OPS_MM_CPU_PRESSURE_LOW",  "0.65"))
 GPU_FRACTION       = float(os.environ.get("OPS_MM_GPU_FRACTION",      "0.8"))
@@ -83,7 +85,6 @@ class DataLossError(RuntimeError):
 # BufferState: per-tensor metadata
 # ----------------------------------------------------------------------
 class BufferState:
-    """Metadata record for every tensor known to MemoryManager."""
     __slots__ = (
         "key", "shape", "dtype", "device", "size_bytes",
         "tensor", "is_pinned", "on_disk", "spill_generation",
@@ -109,12 +110,42 @@ class BufferState:
         self.load_failed      = False
         self.last_modified    = time.monotonic()
 
+# ----------------------------------------------------------------------
+# _AsyncFuture
+# ----------------------------------------------------------------------
+class _AsyncFuture:
+    __slots__ = ("_result", "_exception", "_done", "_cond")
+
+    def __init__(self) -> None:
+        self._result    = None
+        self._exception: Optional[BaseException] = None
+        self._done      = False
+        self._cond      = threading.Condition()
+
+    def set_result(self, result: Any) -> None:
+        with self._cond:
+            self._result = result
+            self._done   = True
+            self._cond.notify_all()
+
+    def set_exception(self, exc: BaseException) -> None:
+        with self._cond:
+            self._exception = exc
+            self._done      = True
+            self._cond.notify_all()
+
+    def result(self, timeout: Optional[float] = None) -> Any:
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._done, timeout=timeout):
+                raise TimeoutError("_AsyncFuture timed out")
+            if self._exception:
+                raise self._exception
+            return self._result
 
 # ----------------------------------------------------------------------
 # AdaptiveThrottler
 # ----------------------------------------------------------------------
 class AdaptiveThrottler:
-    """Adaptive backpressure throttler for spill queue depth."""
     def __init__(
         self,
         queue_ref,
@@ -122,12 +153,12 @@ class AdaptiveThrottler:
         min_sleep:       float = 0.001,
         max_sleep:       float = 0.500,
     ) -> None:
-        self._q      = queue_ref
-        self._target = target_fraction
-        self._min    = min_sleep
-        self._max    = max_sleep
-        self._sleep  = min_sleep
-        self._lock   = threading.Lock()
+        self._q               = queue_ref
+        self._target          = target_fraction
+        self._min             = min_sleep
+        self._max             = max_sleep
+        self._sleep           = min_sleep
+        self._lock            = threading.Lock()
 
     def step(self) -> None:
         maxsize = self._q.maxsize
@@ -174,10 +205,6 @@ def _pin_thread_to_numa_node(node: int) -> None:
 # SpillManager
 # ----------------------------------------------------------------------
 class SpillManager:
-    """
-    Asynchronous HDF5 spill manager with compression, LRU quota, and
-    adaptive backpressure.
-    """
     def __init__(
         self,
         spill_dir:         str,
@@ -198,23 +225,12 @@ class SpillManager:
         self._write_queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self._read_queue:  queue.Queue = queue.Queue()
         self._stop                     = False
-        self._files_lru: OrderedDict   = OrderedDict()  # path -> (size, key, gen)
+        self._files_lru: OrderedDict   = OrderedDict()   # path -> (size, key, gen)
         self._lock                     = threading.RLock()
-
-        self._callback_executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="mm-load-cb"
-        )
+        self._key_to_path: Dict[Tuple[str, int], str] = {}
 
         self._throttler = AdaptiveThrottler(self._write_queue)
         self._start_workers()
-
-    @staticmethod
-    def _get_path(spill_dir: str, key: str, generation: int) -> str:
-        digest = hashlib.sha1(f"{key}\x00{generation}".encode()).hexdigest()
-        return os.path.join(spill_dir, f"{digest}.h5")
-
-    def _path(self, key: str, generation: int) -> str:
-        return SpillManager._get_path(self.spill_dir, key, generation)
 
     def _start_workers(self) -> None:
         node = self._numa_node
@@ -246,23 +262,18 @@ class SpillManager:
                 except queue.Empty:
                     continue
 
-        self._writer_thread = threading.Thread(
-            target=writer_loop, daemon=True, name="mm-spill-writer"
-        )
-        self._reader_thread = threading.Thread(
-            target=reader_loop, daemon=True, name="mm-spill-reader"
-        )
+        self._writer_thread = threading.Thread(target=writer_loop, daemon=True, name="mm-spill-writer")
+        self._reader_thread = threading.Thread(target=reader_loop, daemon=True, name="mm-spill-reader")
         self._writer_thread.start()
         self._reader_thread.start()
 
-    def _write_sync(
-        self,
-        key:            str,
-        generation:     int,
-        tensor:         torch.Tensor,
-        old_generation: int,
-    ) -> None:
-        path = self._path(key, generation)
+    def _get_path(self, key: str, generation: int) -> str:
+        safe = key.replace("/", "_").replace("\\", "_")
+        ts   = int(time.time() * 1e6)
+        return os.path.join(self.spill_dir, f"{safe}_gen{generation}_{ts}.h5")
+
+    def _write_sync(self, key: str, generation: int, tensor: torch.Tensor, old_generation: int) -> None:
+        path = self._get_path(key, generation)
         arr  = tensor.cpu().numpy()
 
         with h5py.File(path, "w") as f:
@@ -276,25 +287,26 @@ class SpillManager:
 
         with self._lock:
             if old_generation >= 0:
-                old_path = self._path(key, old_generation)
-                if old_path in self._files_lru:
+                old_path = self._key_to_path.pop((key, old_generation), None)
+                if old_path and old_path in self._files_lru:
                     old_size, _, _ = self._files_lru.pop(old_path)
                     self.current_bytes -= old_size
-                if os.path.exists(old_path):
+                if old_path and os.path.exists(old_path):
                     try:
                         os.unlink(old_path)
                     except OSError:
                         pass
-            self._files_lru[path] = (file_size, key, generation)
-            self.current_bytes   += file_size
+            self._files_lru[path]                = (file_size, key, generation)
+            self._key_to_path[(key, generation)] = path
+            self.current_bytes                  += file_size
             if self.current_bytes > self.max_bytes:
                 self._enforce_quota()
 
         self.on_write_complete(key, generation)
 
     def _load_sync(self, key: str, generation: int) -> Optional[torch.Tensor]:
-        path = self._path(key, generation)
-        if not os.path.exists(path):
+        path = self._key_to_path.get((key, generation))
+        if path is None or not os.path.exists(path):
             return None
         try:
             with h5py.File(path, "r") as f:
@@ -310,6 +322,7 @@ class SpillManager:
     def _enforce_quota(self) -> None:
         while self.current_bytes > self.max_bytes and self._files_lru:
             path, (size, key, gen) = self._files_lru.popitem(last=False)
+            self._key_to_path.pop((key, gen), None)
             self.current_bytes -= size
             try:
                 os.unlink(path)
@@ -317,53 +330,32 @@ class SpillManager:
             except OSError:
                 pass
 
-    def spill_async(
-        self,
-        key:            str,
-        generation:     int,
-        tensor:         torch.Tensor,
-        old_generation: int = -1,
-    ) -> None:
-        """Enqueue a spill write; fall back to sync if queue remains full."""
+    def spill_async(self, key: str, generation: int, tensor: torch.Tensor, old_generation: int = -1) -> None:
         for _ in range(5):
             try:
-                self._write_queue.put(
-                    (key, generation, tensor, old_generation), timeout=1.0
-                )
+                self._write_queue.put((key, generation, tensor, old_generation), timeout=1.0)
                 return
             except queue.Full:
                 self._throttler.step()
         self._write_sync(key, generation, tensor, old_generation)
 
-    def load_async(
-        self,
-        key:      str,
-        generation: int,
-        callback: Callable[[Optional[torch.Tensor]], None],
-    ) -> None:
-        future: Future = Future()
+    def load_async(self, key: str, generation: int, callback: Callable[[Optional[torch.Tensor]], None]) -> None:
+        future = _AsyncFuture()
         self._read_queue.put((key, generation, future))
-        self._callback_executor.submit(
-            self._await_and_invoke, future, callback, key, generation
-        )
 
-    def _await_and_invoke(
-        self,
-        future:     Future,
-        callback:   Callable[[Optional[torch.Tensor]], None],
-        key:        str,
-        generation: int,
-    ) -> None:
-        try:
-            callback(future.result(timeout=30.0))
-        except Exception as exc:
-            warnings.warn(
-                f"Async load failed for {key} gen={generation}: {exc}"
-            )
-            callback(None)
+        def _on_done() -> None:
+            try:
+                callback(future.result())
+            except Exception as exc:
+                warnings.warn(f"Async load failed for {key} gen={generation}: {exc}")
+                callback(None)
+
+        threading.Thread(target=_on_done, daemon=True, name="mm-load-cb").start()
 
     def delete_generation(self, key: str, generation: int) -> None:
-        path = self._path(key, generation)
+        path = self._key_to_path.pop((key, generation), None)
+        if path is None:
+            return
         with self._lock:
             if path in self._files_lru:
                 size, _, _ = self._files_lru.pop(path)
@@ -376,7 +368,6 @@ class SpillManager:
 
     def shutdown(self) -> None:
         self._stop = True
-        self._callback_executor.shutdown(wait=False)
         if hasattr(self, "_writer_thread"):
             self._writer_thread.join(timeout=3.0)
         if hasattr(self, "_reader_thread"):
@@ -386,7 +377,6 @@ class SpillManager:
 # PinnedPool
 # ----------------------------------------------------------------------
 class PinnedPool:
-    """Power-of-two bucket pool for pinned CPU memory."""
     def __init__(self, max_bytes: int, pool_depth: int = POOL_DEPTH) -> None:
         self.max_bytes   = max_bytes
         self._pool_depth = pool_depth
@@ -437,7 +427,7 @@ class PinnedPool:
     def release(self, buf: torch.Tensor) -> None:
         if buf is None:
             return
-        stored     = buf.reshape(-1)
+        stored     = buf.clone()
         numel      = stored.numel()
         bucket     = self._bucket(numel)
         key        = (bucket, stored.dtype)
@@ -487,9 +477,7 @@ class AsyncCopyEngine:
                 self._streams[device] = torch.cuda.Stream(device=device)
             return self._streams[device]
 
-    def copy_async(
-        self, src: torch.Tensor, dst: torch.Tensor, retries: int = 2
-    ) -> Optional[torch.cuda.Event]:
+    def copy_async(self, src: torch.Tensor, dst: torch.Tensor, retries: int = 2) -> Optional[torch.cuda.Event]:
         if not torch.cuda.is_available():
             dst.copy_(src)
             return None
@@ -549,51 +537,38 @@ class _IndexedHeap:
         return len(self._heap)
 
 # ----------------------------------------------------------------------
-# EvictionPolicy                                                                                                                                                                                
+# EvictionPolicy
 # ----------------------------------------------------------------------
 class EvictionPolicy:
-    """
-    Supported policies: lru, lru_size, lru_freq, largest_first.
-    """
     def __init__(self, policy: str = "lru_freq") -> None:
         self.policy  = policy
-        self._order: OrderedDict = OrderedDict() 
+        self._order: OrderedDict = OrderedDict()
         self._heap   = _IndexedHeap()
         self._hlock  = threading.RLock()
 
-    def touch(self, key: str, state: Optional["BufferState"] = None) -> None:
-        """
-        Record an access.  Pass the live BufferState so heap-backed policies
-        can compute an accurate score without a second lookup.
-        """
+    def touch(self, key: str) -> None:
         if self.policy == "lru":
             if key in self._order:
                 self._order.move_to_end(key)
             else:
                 self._order[key] = True
-            return
-
-        if state is not None:
-            now = time.monotonic()
-            if self.policy == "lru_freq":
-                recency = 1.0 / (now - state.last_access + 1e-9)
-                score   = -(state.access_count * 0.7 + recency * 0.3)
-            else:
-                score = -float(state.size_bytes)
         else:
-            score = 0.0
+            now = time.monotonic()
+            if self.policy == "lru_size":
+                score = now
+            elif self.policy == "lru_freq":
+                score = now
+            else:  # largest_first
+                score = 0.0
+            with self._hlock:
+                self._heap.push(key, score)
 
-        with self._hlock:
-            self._heap.push(key, score)
-
-    def select_victim(
-        self, live: Dict[str, "BufferState"], needed_bytes: int
-    ) -> Optional[str]:
-        def _eligible(s: "BufferState") -> bool:
+    def select_victim(self, live: Dict[str, BufferState], needed_bytes: int) -> Optional[str]:
+        def _eligible(state: BufferState) -> bool:
             return (
-                not s.is_free
-                and s.tensor is not None
-                and not s.on_disk
+                not state.is_free
+                and state.tensor is not None
+                and not state.on_disk
             )
 
         if self.policy == "lru":
@@ -602,14 +577,46 @@ class EvictionPolicy:
                 if state and _eligible(state):
                     return key
             return None
-        with self._hlock:
-            while True:
-                key = self._heap.pop_valid()
-                if key is None:
-                    return None
-                state = live.get(key)
-                if state and _eligible(state):
-                    return key
+
+        elif self.policy == "lru_size":
+            now = time.monotonic()
+            with self._hlock:
+                for key, state in live.items():
+                    if _eligible(state):
+                        score = -state.size_bytes
+                        self._heap.push(key, score)
+                return self._heap.pop_valid()
+
+        elif self.policy == "lru_freq":
+            now = time.monotonic()
+            with self._hlock:
+                for key, state in live.items():
+                    if _eligible(state):
+                        recency = 1.0 / (now - state.last_access + 1e-9)
+                        score   = state.access_count * 0.7 + recency * 0.3
+                        self._heap.push(key, score)
+                while True:
+                    key = self._heap.pop_valid()
+                    if key is None:
+                        return None
+                    state = live.get(key)
+                    if state and _eligible(state):
+                        return key
+
+        elif self.policy == "largest_first":
+            with self._hlock:
+                for key, state in live.items():
+                    if _eligible(state):
+                        self._heap.push(key, -state.size_bytes)
+                while True:
+                    key = self._heap.pop_valid()
+                    if key is None:
+                        return None
+                    state = live.get(key)
+                    if state and _eligible(state):
+                        return key
+
+        return None
 
     def remove(self, key: str) -> None:
         self._order.pop(key, None)
@@ -653,10 +660,6 @@ class Telemetry:
 # MemoryManager
 # ----------------------------------------------------------------------
 class MemoryManager:
-    """
-    Pooled tensor allocator with spill-to-disk, prefetch, eviction,
-    and full ops.py API compatibility.
-    """
     def __init__(
         self,
         gpu_fraction:       float = GPU_FRACTION,
@@ -705,10 +708,7 @@ class MemoryManager:
         self._copy_engine   = AsyncCopyEngine()
         self._telemetry     = Telemetry() if TELEMETRY else None
 
-        self._device_pools: Dict[
-            torch.device,
-            Dict[Tuple[int, torch.dtype, torch.device, torch.memory_format], List[torch.Tensor]],
-        ] = {}
+        self._device_pools: Dict[torch.device, Dict[Tuple[int, torch.dtype, torch.device, torch.memory_format], List[torch.Tensor]]] = {}
         self._live:           Dict[str, BufferState] = {}
         self._pending_writes: Dict[str, int]         = {}
 
@@ -716,16 +716,12 @@ class MemoryManager:
         self._prefetch_inflight: set   = set()
         self._prefetch_stop            = False
         self._prefetch_cond            = threading.Condition(self._prefetch_lock)
-        self._prefetch_thread          = threading.Thread(
-            target=self._prefetch_loop, daemon=True, name="mm-prefetch"
-        )
+        self._prefetch_thread          = threading.Thread(target=self._prefetch_loop, daemon=True, name="mm-prefetch")
         self._prefetch_thread.start()
 
-        self._cleaner_stop   = False
-        self._cleaner_cond   = threading.Condition()
-        self._cleaner_thread = threading.Thread(
-            target=self._metadata_cleaner_loop, daemon=True, name="mm-cleaner"
-        )
+        self._cleaner_stop = False
+        self._cleaner_cond = threading.Condition()
+        self._cleaner_thread = threading.Thread(target=self._metadata_cleaner_loop, daemon=True, name="mm-cleaner")
         self._cleaner_thread.start()
 
         atexit.register(self.shutdown)
@@ -767,9 +763,7 @@ class MemoryManager:
             if state and state.spill_generation == generation and state.on_disk:
                 state.load_failed   = True
                 state.last_modified = time.monotonic()
-                warnings.warn(
-                    f"Spill file for '{key}' gen={generation} deleted by quota — buffer lost"
-                )
+                warnings.warn(f"Spill file for '{key}' gen={generation} deleted by quota — buffer lost")
 
     def _on_spill_write_complete(self, key: str, generation: int) -> None:
         with self._live_lock:
@@ -781,16 +775,11 @@ class MemoryManager:
     # ------------------------------------------------------------------
     def _metadata_cleaner_loop(self) -> None:
         while not self._cleaner_stop:
-            # FIX 5: read live count under the correct lock.
-            with self._live_lock:
-                live_count = len(self._live)
-            interval = 10 if live_count > 500 else 30
-
             with self._cleaner_cond:
+                interval = 10 if len(self._live) > 500 else 30
                 self._cleaner_cond.wait_for(lambda: self._cleaner_stop, timeout=interval)
             if self._cleaner_stop:
                 break
-
             now = time.monotonic()
             to_delete: List[str] = []
             with self._live_lock:
@@ -832,9 +821,7 @@ class MemoryManager:
                     with self._prefetch_cond:
                         self._prefetch_inflight.discard(key)
                         if len(self._prefetch_inflight) > 4096:
-                            self._prefetch_inflight = set(
-                                list(self._prefetch_inflight)[-2048:]
-                            )
+                            self._prefetch_inflight = set(list(self._prefetch_inflight)[-2048:])
 
     def _do_prefetch(self, key: str, target_dev: torch.device) -> None:
         event_to_wait: Optional[torch.cuda.Event] = None
@@ -847,16 +834,12 @@ class MemoryManager:
             if state.on_disk and state.tensor is None:
                 current_gen = state.spill_generation
 
-                def _on_load(
-                    tensor: Optional[torch.Tensor],
-                    _key: str = key,
-                    _gen: int = current_gen,
-                ) -> None:
+                def _on_load(tensor: Optional[torch.Tensor], _key: str = key, _gen: int = current_gen) -> None:
                     if tensor is None:
                         with self._live_lock:
                             s = self._live.get(_key)
                             if s:
-                                s.load_failed   = True
+                                s.load_failed = True
                                 s.last_modified = time.monotonic()
                             if self._telemetry:
                                 self._telemetry.inc("load_failures")
@@ -880,7 +863,7 @@ class MemoryManager:
                                 s2 = self._live.get(_key)
                                 if s2 is None:
                                     return
-                                old_t     = s2.tensor
+                                old_t = s2.tensor
                                 s2.tensor = gpu_t
                                 s2.copy_event = event
                             if old_t is not None:
@@ -893,20 +876,16 @@ class MemoryManager:
                 self.spill_mgr.load_async(key, current_gen, _on_load)
                 return
 
-            if (
-                state.tensor is not None
-                and state.tensor.device.type == "cpu"
-                and target_dev.type == "cuda"
-            ):
+            if state.tensor is not None and state.tensor.device.type == "cpu" and target_dev.type == "cuda":
                 old_tensor = state.tensor
                 try:
                     gpu_t = self._allocate_device_buffer(state.shape, target_dev, state.dtype)
                     event = self._copy_engine.copy_async(old_tensor, gpu_t)
                     if event is None:
                         return
-                    state.tensor      = gpu_t
-                    state.copy_event  = event
-                    event_to_wait     = event
+                    state.tensor = gpu_t
+                    state.copy_event = event
+                    event_to_wait = event
                     if self._telemetry:
                         self._telemetry.add("bytes_transfer_h2d", state.size_bytes)
                 except RuntimeError as exc:
@@ -944,11 +923,7 @@ class MemoryManager:
         with self._live_lock:
             if len(self._live) >= self.max_live_entries:
                 free_candidates = sorted(
-                    (
-                        (s.last_access, k)
-                        for k, s in self._live.items()
-                        if s.is_free and not s.on_disk
-                    )
+                    ((s.last_access, k) for k, s in self._live.items() if s.is_free and not s.on_disk)
                 )
                 if free_candidates:
                     for _, old_key in free_candidates[:10]:
@@ -970,7 +945,7 @@ class MemoryManager:
                     self._pending_writes_cond.wait(timeout=remaining)
                 state.last_access   = time.monotonic()
                 state.access_count += 1
-                self.eviction.touch(key, state)
+                self.eviction.touch(key)
                 if self._telemetry:
                     self._telemetry.inc("allocation_hits")
                 event_to_wait    = state.copy_event
@@ -998,7 +973,7 @@ class MemoryManager:
                     state.last_access   = time.monotonic()
                     state.access_count += 1
                     state.last_modified = time.monotonic()
-                    self.eviction.touch(key, state)
+                    self.eviction.touch(key)
                     if self._telemetry:
                         self._telemetry.inc("loads")
                         self._telemetry.add("bytes_loaded", state.size_bytes)
@@ -1027,9 +1002,7 @@ class MemoryManager:
                     break
                 torch.cuda.empty_cache()
                 if attempt == 2:
-                    raise MemoryError(
-                        f"Cannot allocate {shape} dtype={dtype} on {device} — GPU exhausted"
-                    )
+                    raise MemoryError(f"Cannot allocate {shape} dtype={dtype} on {device} — GPU exhausted")
                 time.sleep(0.1)
 
         # CPU memory pressure handling
@@ -1068,14 +1041,11 @@ class MemoryManager:
                     self._telemetry.inc("allocations")
 
         with self._live_lock:
-            new_state = BufferState(
-                key, tensor,
-                is_pinned=(device.type == "cpu" and tensor.is_pinned()),
-            )
+            new_state = BufferState(key, tensor, is_pinned=(device.type == "cpu" and tensor.is_pinned()))
             self._live[key] = new_state
-            self.eviction.touch(key, new_state)
+            self.eviction.touch(key)
 
-        tensor._mm_key = key 
+        tensor._mm_key = key  # type: ignore[attr-defined]
         return tensor
 
     @staticmethod
@@ -1084,13 +1054,7 @@ class MemoryManager:
             return 1
         return 1 << (numel - 1).bit_length()
 
-    def _allocate_device_buffer(
-        self,
-        shape:  Tuple[int, ...],
-        device: torch.device,
-        dtype:  torch.dtype,
-        layout: torch.memory_format = torch.contiguous_format,
-    ) -> torch.Tensor:
+    def _allocate_device_buffer(self, shape: Tuple[int, ...], device: torch.device, dtype: torch.dtype, layout: torch.memory_format = torch.contiguous_format) -> torch.Tensor:
         return torch.zeros(shape, dtype=dtype, device=device).to(memory_format=layout)
 
     def _release_device_buffer(self, tensor: torch.Tensor, key: str) -> None:
@@ -1126,10 +1090,7 @@ class MemoryManager:
                 return
             if state.tensor is not None:
                 dev_type = state.tensor.device.type
-                pressure = (
-                    self.memory_pressure(state.tensor.device)
-                    if dev_type == "cuda" else 0.0
-                )
+                pressure = self.memory_pressure(state.tensor.device) if dev_type == "cuda" else 0.0
                 if dev_type == "cuda" and pressure > 0.7:
                     spill_args = self._spill_locked(key, state)
                 else:
@@ -1150,13 +1111,13 @@ class MemoryManager:
     def _spill_locked(self, key: str, state: BufferState) -> Optional[tuple]:
         if key in self._pending_writes or state.tensor is None or state.on_disk:
             return None
-        old_gen                   = state.spill_generation
-        new_gen                   = old_gen + 1
-        state.spill_generation    = new_gen
+        old_gen                = state.spill_generation
+        new_gen                = old_gen + 1
+        state.spill_generation = new_gen
         self._pending_writes[key] = new_gen
-        state.on_disk             = True
-        spill_tensor              = state.tensor
-        state.tensor              = None
+        state.on_disk          = True
+        spill_tensor           = state.tensor
+        state.tensor           = None
         if self._telemetry:
             self._telemetry.inc("spills")
             self._telemetry.add("bytes_spilled", state.size_bytes)
@@ -1221,11 +1182,7 @@ class MemoryManager:
     # ------------------------------------------------------------------
     # GPU defragmentation
     # ------------------------------------------------------------------
-    def defragment_gpu(
-        self,
-        device:             Optional[torch.device] = None,
-        pressure_threshold: float = 0.70,
-    ) -> int:
+    def defragment_gpu(self, device: Optional[torch.device] = None, pressure_threshold: float = 0.70) -> int:
         if not torch.cuda.is_available():
             return 0
         dev = device or torch.device("cuda", 0)
@@ -1271,10 +1228,7 @@ class MemoryManager:
         if not torch.cuda.is_available():
             return 0.0
         dev = device or torch.device("cuda", 0)
-        return (
-            torch.cuda.memory_allocated(dev)
-            / torch.cuda.get_device_properties(dev).total_memory
-        )
+        return torch.cuda.memory_allocated(dev) / torch.cuda.get_device_properties(dev).total_memory
 
     def cpu_memory_pressure(self) -> float:
         if not _HAS_PSUTIL:
@@ -1287,19 +1241,11 @@ class MemoryManager:
     def should_manage(self, shape: Tuple[int, ...]) -> bool:
         return math.prod(shape) >= 1024
 
-    def allocate_tensor(
-        self, shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
+    def allocate_tensor(self, shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         return self.get_buffer(shape, dtype, device)
 
-    def allocate(
-        self,
-        shape:  Tuple[int, ...],
-        device: torch.device,
-        key:    Optional[str]       = None,
-        layout: torch.memory_format = torch.contiguous_format,
-        dtype:  torch.dtype         = torch.float64,
-    ) -> torch.Tensor:
+    def allocate(self, shape: Tuple[int, ...], device: torch.device, key: Optional[str] = None,
+                 layout: torch.memory_format = torch.contiguous_format, dtype: torch.dtype = torch.float64) -> torch.Tensor:
         return self.get_buffer(shape=shape, dtype=dtype, device=device, key=key, layout=layout)
 
     def release(self, tensor: torch.Tensor, key: Optional[str] = None) -> None:
@@ -1318,40 +1264,29 @@ class MemoryManager:
             tensor = tensor.pin_memory()
         return tensor
 
-    def make_field(
-        self,
-        tensor:  torch.Tensor,
-        spacing: Tuple[float, ...],
-        origin:  Optional[Tuple[float, ...]] = None,
-        key:     Optional[str] = None,
-    ):
+    def make_field(self, tensor: torch.Tensor, spacing: Tuple[float, ...],
+                   origin: Optional[Tuple[float, ...]] = None, key: Optional[str] = None):
         from stenpy import Field
         key = key or f"field_{id(tensor)}"
         with self._live_lock:
             if key not in self._live:
                 st = BufferState(key, tensor, is_pinned=tensor.is_pinned())
                 self._live[key] = st
-                self.eviction.touch(key, st)
+                self.eviction.touch(key)
                 tensor._mm_key = key
         return Field(tensor=tensor, spacing=spacing, origin=origin, mm=self, key=key)
 
-    def allocate_field(
-        self,
-        shape:   Tuple[int, ...],
-        spacing: Tuple[float, ...],
-        origin:  Optional[Tuple[float, ...]] = None,
-        device:  torch.device = torch.device("cpu"),
-        key:     Optional[str] = None,
-        layout:  torch.memory_format = torch.contiguous_format,
-    ):
+    def allocate_field(self, shape: Tuple[int, ...], spacing: Tuple[float, ...],
+                       origin: Optional[Tuple[float, ...]] = None,
+                       device: torch.device = torch.device("cpu"),
+                       key: Optional[str] = None,
+                       layout: torch.memory_format = torch.contiguous_format):
         from stenpy import Field
-        key    = key or f"field_{'_'.join(map(str, shape))}"
+        key = key or f"field_{'_'.join(map(str, shape))}"
         tensor = self.get_buffer(shape, torch.float64, device, key, layout)
         return Field(tensor=tensor, spacing=spacing, origin=origin, mm=self, key=key)
 
-    def halo_exchange(
-        self, shard: torch.Tensor, radius: int, dims: Optional[List[int]] = None
-    ) -> torch.Tensor:
+    def halo_exchange(self, shard: torch.Tensor, radius: int, dims: Optional[List[int]] = None) -> torch.Tensor:
         return shard
 
     def all_reduce_sum(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1368,10 +1303,8 @@ class MemoryManager:
     def clear_pool(self) -> None:
         with self._pool_lock:
             self._device_pools.clear()
-        total_ram = psutil.virtual_memory().total if _HAS_PSUTIL else 16 * 1024 ** 3
-        self.pinned_pool = PinnedPool(
-            int(total_ram * self.cpu_pressure_high), pool_depth=self._pool_depth
-        )
+        total_ram = psutil.virtual_memory().total if _HAS_PSUTIL else 16 * 1024**3
+        self.pinned_pool = PinnedPool(int(total_ram * self.cpu_pressure_high), pool_depth=self._pool_depth)
         if hasattr(self, "spill_mgr") and self.spill_mgr is not None:
             self.spill_mgr.shutdown()
         self.spill_mgr = SpillManager(
@@ -1383,16 +1316,8 @@ class MemoryManager:
         with self._live_lock:
             live = len(self._live)
         with self._pool_lock:
-            pools = sum(
-                len(lst)
-                for dev in self._device_pools.values()
-                for lst in dev.values()
-            )
-        return (
-            f"MemoryManager(live={live}, pooled={pools}, "
-            f"policy={self.eviction.policy}, gpu_frac={self.gpu_fraction}, "
-            f"compress={_COMPRESS_NAME})"
-        )
+            pools = sum(len(lst) for dev in self._device_pools.values() for lst in dev.values())
+        return f"MemoryManager(live={live}, pooled={pools}, policy={self.eviction.policy}, gpu_frac={self.gpu_fraction}, compress={_COMPRESS_NAME})"
 
 # ----------------------------------------------------------------------
 # patching of sten.MemoryManager
