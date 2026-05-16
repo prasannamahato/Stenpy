@@ -1392,6 +1392,10 @@ def _hdf5_direct_chunked_run(
         torch.cuda.empty_cache()
         _nerd(f"post-probe VRAM: {torch.cuda.memory_allocated(device)/1024**3:.3f} GB")
 
+    # Single shared runtime for all chunks — avoids per-chunk thread spawning
+    _chunk_mm = stenpy.MemoryManager()
+    _chunk_rt = stenpy.Runtime(_chunk_mm, device=str(device))
+
     out_full_shape = (total_rows,) + out_trailing
     out_f  = _h5py.File(out_path, "w")
     out_ds = out_f.create_dataset(
@@ -1494,8 +1498,7 @@ def _hdf5_direct_chunked_run(
 
             t_compute_start = time.perf_counter()
             with torch.no_grad():
-                chunk_rt      = stenpy.Runtime(stenpy.MemoryManager(), device=str(device))
-                chunk_results = chunk_rt.run(chunk_graph)
+                chunk_results = _chunk_rt.run(chunk_graph)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             chunk_compute_times.append(time.perf_counter() - t_compute_start)
@@ -1504,8 +1507,8 @@ def _hdf5_direct_chunked_run(
 
             t_dh_start = time.perf_counter()
             out_cpu = (out_gpu.detach().cpu()
-                       if isinstance(out_gpu, torch.Tensor)
-                       else torch.zeros((row_end - row_start,) + out_trailing,
+                    if isinstance(out_gpu, torch.Tensor)
+                    else torch.zeros((row_end - row_start,) + out_trailing,
                                         dtype=torch.float64))
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -1513,13 +1516,16 @@ def _hdf5_direct_chunked_run(
 
             vram_before_free = (torch.cuda.memory_allocated(device)
                                 if device.type == "cuda" else 0)
-            n_live = len(chunk_rt.mm._live) if hasattr(chunk_rt.mm, "_live") else -1
+            n_live = len(_chunk_mm._live) if hasattr(_chunk_mm, "_live") else -1
 
             del chunk_tensors
             del chunk_results
             del out_gpu
             chunk_graph = None
-            del chunk_rt
+            _chunk_mm.clear_pool()
+            with _chunk_mm._lock:
+                _chunk_mm._live.clear()
+                _chunk_mm._pool_ptrs.clear()
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()
