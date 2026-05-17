@@ -225,7 +225,7 @@ class SpillManager:
         self._write_queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self._read_queue:  queue.Queue = queue.Queue()
         self._stop                     = False
-        self._files_lru: OrderedDict   = OrderedDict()   # path -> (size, key, gen)
+        self._files_lru: OrderedDict   = OrderedDict()  
         self._lock                     = threading.RLock()
         self._key_to_path: Dict[Tuple[str, int], str] = {}
 
@@ -558,7 +558,7 @@ class EvictionPolicy:
                 score = now
             elif self.policy == "lru_freq":
                 score = now
-            else:  # largest_first
+            else:  
                 score = 0.0
             with self._hlock:
                 self._heap.push(key, score)
@@ -985,7 +985,6 @@ class MemoryManager:
         if return_tensor is not None:
             return return_tensor
 
-        # GPU memory pressure handling
         if device.type == "cuda":
             total_gpu   = torch.cuda.get_device_properties(device).total_memory
             max_allowed = int(total_gpu * self.gpu_fraction)
@@ -1005,7 +1004,6 @@ class MemoryManager:
                     raise MemoryError(f"Cannot allocate {shape} dtype={dtype} on {device} — GPU exhausted")
                 time.sleep(0.1)
 
-        # CPU memory pressure handling
         if device.type == "cpu" and _HAS_PSUTIL:
             while True:
                 with self._live_lock:
@@ -1017,7 +1015,6 @@ class MemoryManager:
                     self._evict_buffer(victim, keep_metadata=True)
                 time.sleep(0.01)
 
-        # Allocate from pool or create new
         numel    = math.prod(shape)
         bucket   = self._bucket_size(numel)
         pool_key = (bucket, dtype, device, layout)
@@ -1045,7 +1042,7 @@ class MemoryManager:
             self._live[key] = new_state
             self.eviction.touch(key)
 
-        tensor._mm_key = key  # type: ignore[attr-defined]
+        tensor._mm_key = key 
         return tensor
 
     @staticmethod
