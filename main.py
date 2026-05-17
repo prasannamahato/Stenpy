@@ -32,6 +32,23 @@ except ImportError:
     sys.exit("SymPy is required: pip install sympy")
 
 try:
+    import sympy as sp
+    from sympy import Function, Symbol, Add, Mul, Pow
+    from sympy.core.function import AppliedUndef, UndefinedFunction
+except ImportError:
+    sys.exit("SymPy is required: pip install sympy")
+
+def _dbg(msg: str) -> None:
+    """Debug print if OPS_DEBUG env var is set."""
+    if os.environ.get("OPS_DEBUG", "0") == "1":
+        print(f"[DEBUG] {msg}")
+
+try:
+    import stenpy
+except ImportError:
+    sys.exit("sten.py not found — place it in the same directory as main.py")
+
+try:
     import stenpy
 except ImportError:
     sys.exit("sten.py not found — place it in the same directory as main.py")
@@ -1138,6 +1155,7 @@ def _gpu_free_gb(device: torch.device) -> float:
     props = torch.cuda.get_device_properties(device)
     return max(0.0, props.total_memory - torch.cuda.memory_allocated(device)) / 1024**3
 
+
 def _select_device() -> torch.device:
     if not torch.cuda.is_available():
         print("  Device: CPU  (no CUDA GPU found)")
@@ -1171,20 +1189,51 @@ def _select_device() -> torch.device:
 def _select_device_hpc() -> torch.device:
     if not torch.cuda.is_available():
         return torch.device("cpu")
-    local_rank = 0
-    for k in ("SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
-              "MPI_LOCALRANKID", "PMI_LOCAL_RANK"):
-        v = os.environ.get(k)
-        if v is not None:
-            try: local_rank = int(v); break
-            except ValueError: pass
-    else:
-        local_rank = _HPC_RANK
-
-    n_gpu = torch.cuda.device_count()
-    if n_gpu == 0:
+    
+    local_rank = None
+    hpc_vars = [
+        "SLURM_LOCALID",               
+        "OMPI_COMM_WORLD_LOCAL_RANK",    
+        "PMI_LOCAL_RANK",              
+        "JSM_NAMESPACE_LOCAL_RANK",        
+        "MPI_LOCALRANKID",              
+    ]
+    
+    for var_name in hpc_vars:
+        val = os.environ.get(var_name)
+        if val is not None:
+            try:
+                local_rank = int(val.strip())
+                _dbg(f"_select_device_hpc: Using {var_name}={local_rank}")
+                break
+            except (ValueError, TypeError, AttributeError):
+                continue
+    
+    if local_rank is None:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if visible and visible != "-1":
+            try:
+                gpu_ids = [int(x.strip()) for x in visible.split(",") if x.strip()]
+                if gpu_ids:
+                    local_rank = 0  # Use first visible GPU
+                    _dbg(f"_select_device_hpc: Using CUDA_VISIBLE_DEVICES, local_rank=0")
+            except (ValueError, AttributeError):
+                pass
+    
+    if local_rank is None:
+        local_rank = 0
+        _dbg("_select_device_hpc: No HPC env vars found, defaulting to local_rank=0")
+    
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
         return torch.device("cpu")
-    return torch.device(f"cuda:{local_rank % n_gpu}")
+    
+    selected_gpu = local_rank % n_gpus
+    device = torch.device(f"cuda:{selected_gpu}")
+    _dbg(f"_select_device_hpc: Assigned local_rank={local_rank} → cuda:{selected_gpu} ({n_gpus} GPUs total)")
+    
+    return device
+
 
 def _select_boundary() -> str:
     opts = {"1": "neumann", "2": "dirichlet", "3": "periodic", "4": "reflect"}
@@ -1198,6 +1247,7 @@ def _select_boundary() -> str:
     except (EOFError, KeyboardInterrupt):
         return "neumann"
     return opts.get(raw, "neumann")
+
 
 # ----------------------------------------------------------------------
 # VRAM management
@@ -1226,6 +1276,7 @@ def _flush_vram(device: torch.device, verbose: bool = True) -> None:
             print(f"     before     : alloc {before_alloc/1024**3:.3f} GB  "
                   f"res {before_res/1024**3:.3f} GB")
             print(f"     headroom   : {(total - after_alloc/1024**3):.3f} GB free")
+
 
 def _prompt_vram_flush(device: torch.device) -> None:
     if _IS_HPC or device.type != "cuda":
@@ -1299,7 +1350,7 @@ def _compute_chunk_rows(
     except Exception:
         return max(1, full_shape[0] // 16)
 
-def _open_hdf5_field(path: str) -> Tuple["_h5py.Dataset", Tuple[int, ...]]:
+def _open_hdf5_field(path: str) -> Tuple[_h5py.Dataset, Tuple[int, ...]]:
     f   = _h5py.File(path, "r")
     key = next(
         (k for k in ("data", "field") if k in f and isinstance(f[k], _h5py.Dataset)),
@@ -1323,7 +1374,6 @@ def _graph_multi_replace(
 
 
 def _safe_mm_clear(mm: Any) -> None:
-    """Clear the MemoryManager pool without assuming specific internal attributes."""
     try:
         mm.clear_pool()
     except Exception:
@@ -1359,6 +1409,14 @@ def _hdf5_direct_chunked_run(
     device:      torch.device,
     verbose:     bool = True,
 ) -> Dict[str, Any]:
+    """
+    Direct HDF5 streaming with chunked processing.
+    
+    FIXED: 
+    - Don't mutate base_graph._nodes during chunk loop
+    - Create fresh graph per chunk from base
+    - Thread-safe file operations
+    """
     handles:    Dict[str, "_h5py.Dataset"] = {}
     hdf5_files: List["_h5py.File"]        = []
     shapes:     Dict[str, Tuple[int, ...]] = {}
@@ -1399,6 +1457,7 @@ def _hdf5_direct_chunked_run(
         if device.type == "cuda":
             print(f"  {_vram_bar(device)}")
 
+    # ========== PROBE: Compile expression on small sample ==========
     probe_rows = min(8, total_rows)
     probe_fmap: Dict[str, torch.Tensor] = dict(scalar_map)
     for name, ds in handles.items():
@@ -1410,7 +1469,7 @@ def _hdf5_direct_chunked_run(
     _nerd(f"probe: {probe_rows} rows, compiling expression …")
 
     t_compile_start = time.perf_counter()
-    pre_graph, pre_sink, warns, field_node_ids, _sympy_expr = compile_expression(
+    base_graph, pre_sink, warns, field_node_ids, _sympy_expr = compile_expression(
         expr_str, dx=dx, boundary=boundary, field_map=probe_fmap
     )
     t_compile_end = time.perf_counter()
@@ -1418,19 +1477,19 @@ def _hdf5_direct_chunked_run(
 
     with torch.no_grad():
         probe_rt      = stenpy.Runtime(stenpy.MemoryManager(), device=str(device))
-        probe_out_map = probe_rt.run(pre_graph)
+        probe_out_map = probe_rt.run(base_graph)
 
     probe_out    = probe_out_map.get(pre_sink)
     out_trailing = tuple(probe_out.shape[1:]) if isinstance(probe_out, torch.Tensor) else ()
 
     _nerd(f"probe output trailing dims: {out_trailing}  field_node_ids: {field_node_ids}")
 
-    del probe_fmap, probe_out_map, probe_out
-    del probe_rt
+    del probe_fmap, probe_out_map, probe_out, probe_rt
     if device.type == "cuda":
         torch.cuda.empty_cache()
         _nerd(f"post-probe VRAM: {torch.cuda.memory_allocated(device)/1024**3:.3f} GB")
 
+    # ========== Setup output HDF5 file ==========
     _chunk_mm = stenpy.MemoryManager()
     _chunk_rt = stenpy.Runtime(_chunk_mm, device=str(device))
 
@@ -1461,7 +1520,6 @@ def _hdf5_direct_chunked_run(
     chunk_dh_times:      List[float] = []
     chunk_write_times:   List[float] = []
 
-
     pinned_bufs: Dict[str, Optional[torch.Tensor]] = {}
     if device.type == "cuda":
         for name in handles:
@@ -1490,8 +1548,6 @@ def _hdf5_direct_chunked_run(
             read_q.put(exc)
 
     write_q: Queue = Queue(maxsize=_PIPELINE_DEPTH)
-
-
     _writer_stop = threading.Event()
 
     def _writer() -> None:
@@ -1534,7 +1590,6 @@ def _hdf5_direct_chunked_run(
                     raise item
 
                 ci, row_start, row_end, chunk_np = item
-
                 t_h2d_start = time.perf_counter()
                 chunk_tensors: Dict[str, torch.Tensor] = {}
                 for name, arr in chunk_np.items():
@@ -1546,7 +1601,6 @@ def _hdf5_direct_chunked_run(
                         buf.copy_(torch.from_numpy(arr))          
                         chunk_tensors[name] = buf.to(device, non_blocking=True)
                     elif device.type == "cuda":
-
                         t_cpu = torch.from_numpy(arr)
                         chunk_tensors[name] = t_cpu.pin_memory().to(device, non_blocking=True)
                     else:
@@ -1554,19 +1608,30 @@ def _hdf5_direct_chunked_run(
                     bytes_in += arr.nbytes
                 del chunk_np
                 if device.type == "cuda":
-                    torch.cuda.synchronize(device)
+                    torch.cuda.current_stream(device).synchronize()
                 chunk_h2d_times.append(time.perf_counter() - t_h2d_start)
 
-                for name, tensor in chunk_tensors.items():
-                    nid = field_node_ids.get(name)
-                    if nid is not None and nid in pre_graph._nodes:
-                        pre_graph._nodes[nid].params["value"] = tensor
+                # ========== FIX: Create fresh graph per chunk ==========
+                # Don't mutate base_graph! Clone it instead.
+                chunk_graph = stenpy.Graph()
+                for node_id in base_graph._order:
+                    node = base_graph._nodes[node_id]
+                    
+                    # Check if this node corresponds to a field input
+                    field_name = next((n for n, nid in field_node_ids.items() if nid == node_id), None)
+                    
+                    if field_name and field_name in chunk_tensors:
+                        # Replace with current chunk tensor
+                        chunk_graph.add("_constant", (), {"value": chunk_tensors[field_name]}, node_id=node_id)
+                    else:
+                        # Copy node as-is
+                        chunk_graph.add(node.op_name, node.input_ids, dict(node.params), node_id=node_id)
 
                 t_compute_start = time.perf_counter()
                 with torch.no_grad():
-                    chunk_results = _chunk_rt.run(pre_graph)
+                    chunk_results = _chunk_rt.run(chunk_graph)
                 if device.type == "cuda":
-                    torch.cuda.synchronize(device)
+                    torch.cuda.current_stream(device).synchronize()
                 chunk_compute_times.append(time.perf_counter() - t_compute_start)
 
                 out_gpu = chunk_results.get(pre_sink)
@@ -1577,14 +1642,14 @@ def _hdf5_direct_chunked_run(
                         else torch.zeros((row_end - row_start,) + out_trailing,
                                             dtype=torch.float64))
                 if device.type == "cuda":
-                    torch.cuda.synchronize(device)
+                    torch.cuda.current_stream(device).synchronize()
                 chunk_dh_times.append(time.perf_counter() - t_dh_start)
 
                 vram_before_free = (torch.cuda.memory_allocated(device)
                                     if device.type == "cuda" else 0)
                 n_live = len(_chunk_mm._live) if hasattr(_chunk_mm, "_live") else -1
 
-                del chunk_tensors
+                del chunk_tensors, chunk_graph
                 del chunk_results
                 del out_gpu
 
@@ -1683,6 +1748,7 @@ def _hdf5_direct_chunked_run(
         "input_gb":        bytes_in / 1024**3,
         "output_gb":       out_gb,
     }
+
 
 # ----------------------------------------------------------------------
 # Pipeline executor
@@ -2036,9 +2102,6 @@ class Pipeline:
                 perf=perf,
             )
 
-        # ------------------------------------------------------------------
-        # Eager (in-VRAM) path
-        # ------------------------------------------------------------------
         t_compile_start = time.perf_counter()
         try:
             graph, sink_id, warns, field_node_ids, sympy_expr = compile_expression(
