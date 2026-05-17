@@ -522,7 +522,6 @@ class Runtime:
 
         n_chunks = math.ceil(total / chunk_size)
 
-        # probe first chunk for output shape
         idx0: List[Any] = [slice(None)] * len(lazy_field.shape)
         idx0[chunk_dim] = slice(0, min(chunk_size, total))
         arr0 = lazy_field[tuple(idx0)]
@@ -544,7 +543,6 @@ class Runtime:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # HDF5 output
         h5f = h5_dset = None
         write_dim = chunk_dim
         if out_path is not None:
@@ -805,13 +803,14 @@ def _trim_slices(
     overlap: int,
     ndim: int,
     global_shape: Tuple[int, ...],
+    read_tile_shape: Optional[Tuple[int, ...]] = None,
 ) -> List:
     trim = []
     for d in range(ndim):
         ws = write_slices[d]
         lo = overlap if ws.start > 0 else 0
         hi = overlap if ws.stop < global_shape[d] else 0
-        n_t = tile_shape[d]
+        n_t = read_tile_shape[d] if (read_tile_shape is not None) else tile_shape[d]
         trim.append(slice(lo, n_t - hi if hi else n_t))
     for _ in range(ndim, len(tile_shape)):
         trim.append(slice(None))
@@ -985,55 +984,141 @@ register_operator("tanh", tanh, cost="medium")
 
 
 def _pad1d(t: torch.Tensor, dim: int, r: int, bc: str) -> torch.Tensor:
-    ndim = t.ndim
-    if bc == "neumann":
-        sl_lo = [slice(None)] * ndim
-        sl_lo[dim] = slice(0, 1)
-        sl_hi = [slice(None)] * ndim
-        sl_hi[dim] = slice(-1, None)
-        lo = t[tuple(sl_lo)].expand(*[-1 if i != dim else r for i in range(ndim)]).contiguous()
-        hi = t[tuple(sl_hi)].expand(*[-1 if i != dim else r for i in range(ndim)]).contiguous()
-        return torch.cat([lo, t, hi], dim=dim)
-    elif bc == "dirichlet":
-        sh_lo = list(t.shape)
-        sh_lo[dim] = r
-        sh_hi = list(t.shape)
-        sh_hi[dim] = r
-        lo = torch.zeros(sh_lo, dtype=t.dtype, device=t.device)
-        hi = torch.zeros(sh_hi, dtype=t.dtype, device=t.device)
-        return torch.cat([lo, t, hi], dim=dim)
-    elif bc == "periodic":
-        sl_lo = [slice(None)] * ndim
-        sl_lo[dim] = slice(-r, None)
-        sl_hi = [slice(None)] * ndim
-        sl_hi[dim] = slice(0, r)
-        return torch.cat([t[tuple(sl_lo)].contiguous(), t, t[tuple(sl_hi)].contiguous()], dim=dim)
-    elif bc == "reflect":
-        sl_lo = [slice(None)] * ndim
-        sl_lo[dim] = slice(1, r + 1)
-        sl_hi = [slice(None)] * ndim
-        sl_hi[dim] = slice(-(r + 1), -1)
-        lo = t[tuple(sl_lo)].flip(dim).contiguous()
-        hi = t[tuple(sl_hi)].flip(dim).contiguous()
-        return torch.cat([lo, t, hi], dim=dim)
-    else:
-        sh_lo = list(t.shape)
-        sh_lo[dim] = r
-        sh_hi = list(t.shape)
-        sh_hi[dim] = r
-        lo = torch.zeros(sh_lo, dtype=t.dtype, device=t.device)
-        hi = torch.zeros(sh_hi, dtype=t.dtype, device=t.device)
-        return torch.cat([lo, t, hi], dim=dim)
-
+    """Pad a tensor along a specific dimension.
+    
+    Args:
+        t: Input tensor
+        dim: Dimension to pad along (0-indexed)
+        r: Padding radius (pad r elements on each side)
+        bc: Boundary condition ('neumann', 'dirichlet', 'periodic', 'reflect')
+    
+    Returns:
+        Padded tensor
+    """
+    mode_map = {
+        "neumann": "replicate",
+        "dirichlet": "constant", 
+        "periodic": "circular",
+        "reflect": "reflect",
+    }
+    mode = mode_map.get(bc, "constant")
+    value = 0.0 if mode == "constant" else 0.0
+    
+    pad = [0] * (2 * t.ndim)
+    
+    pad_idx = 2 * (t.ndim - 1 - dim)
+    pad[pad_idx] = r
+    pad[pad_idx + 1] = r
+    
+    try:
+        return F.pad(t, pad, mode=mode, value=value)
+    except RuntimeError:
+        new_shape = list(t.shape)
+        new_shape[dim] += 2 * r
+        padded = torch.zeros(new_shape, dtype=t.dtype, device=t.device)
+        
+        src_slices = [slice(None)] * t.ndim
+        dst_slices = [slice(None)] * t.ndim
+        dst_slices[dim] = slice(r, -r) if r > 0 else slice(None)
+        padded[tuple(dst_slices)] = t
+        
+        if mode == "replicate":
+            if r > 0:
+                left_src = [slice(None)] * t.ndim
+                left_src[dim] = 0
+                left_val = t[tuple(left_src)]
+                
+                for i in range(r):
+                    left_dst = [slice(None)] * t.ndim
+                    left_dst[dim] = i
+                    padded[tuple(left_dst)] = left_val
+                
+                right_src = [slice(None)] * t.ndim
+                right_src[dim] = -1
+                right_val = t[tuple(right_src)]
+                
+                for i in range(r):
+                    right_dst = [slice(None)] * t.ndim
+                    right_dst[dim] = -r + i
+                    padded[tuple(right_dst)] = right_val
+        elif mode == "constant":
+            pass
+        elif mode == "circular":
+            if r > 0:
+                left_src = [slice(None)] * t.ndim
+                left_src[dim] = slice(-r, None)
+                left_data = t[tuple(left_src)]
+                
+                left_dst = [slice(None)] * t.ndim
+                left_dst[dim] = slice(0, r)
+                padded[tuple(left_dst)] = left_data
+                
+                right_src = [slice(None)] * t.ndim
+                right_src[dim] = slice(0, r)
+                right_data = t[tuple(right_src)]
+                
+                right_dst = [slice(None)] * t.ndim
+                right_dst[dim] = slice(-r, None)
+                padded[tuple(right_dst)] = right_data
+        elif mode == "reflect":
+            if r > 0 and t.shape[dim] > 1:
+                for i in range(r):
+                    src_idx = min(i + 1, t.shape[dim] - 1)
+                    left_src = [slice(None)] * t.ndim
+                    left_src[dim] = src_idx
+                    left_val = t[tuple(left_src)]
+                    
+                    left_dst = [slice(None)] * t.ndim
+                    left_dst[dim] = r - 1 - i
+                    padded[tuple(left_dst)] = left_val
+                
+                for i in range(r):
+                    src_idx = max(t.shape[dim] - 2 - i, 0)
+                    right_src = [slice(None)] * t.ndim
+                    right_src[dim] = src_idx
+                    right_val = t[tuple(right_src)]
+                    
+                    right_dst = [slice(None)] * t.ndim
+                    right_dst[dim] = -r + i
+                    padded[tuple(right_dst)] = right_val
+        
+        return padded
 
 def gradient(t: torch.Tensor, dim: int = 0, dx: float = 1.0, boundary: str = "neumann", alloc=None) -> torch.Tensor:
+    """Compute gradient along a single dimension.
+    
+    For scalar fields: returns tensor of same shape
+    For vector fields (last dim = 2 or 3): returns tensor with extra dimension
+    """
     _assert_fp64(t, "gradient")
-    ext = _pad1d(t, dim, 1, boundary)
-    left = ext.narrow(dim, 0, t.shape[dim])
-    right = ext.narrow(dim, 2, t.shape[dim])
-    out = (right - left) * (0.5 / dx)
+    
+    is_vector_field = t.ndim >= 2 and t.shape[-1] in (2, 3)
+    
+    if is_vector_field:
+        components = []
+        n_components = t.shape[-1]
+        
+        for i in range(n_components):
+            comp = t[..., i]
+            
+            ext = _pad1d(comp, dim, 1, boundary)
+            left = ext.narrow(dim, 0, comp.shape[dim])
+            right = ext.narrow(dim, 2, comp.shape[dim])
+            comp_grad = (right - left) * (0.5 / dx)
+            components.append(comp_grad)
+        
+        out = torch.stack(components, dim=-1)
+        
+        if out.ndim == t.ndim:
+            out = out.unsqueeze(-1)
+    else:
+        ext = _pad1d(t, dim, 1, boundary)
+        left = ext.narrow(dim, 0, t.shape[dim])
+        right = ext.narrow(dim, 2, t.shape[dim])
+        out = (right - left) * (0.5 / dx)
+    
     if alloc:
-        buf = alloc(t.shape, t.device, key=_uid("grad"))
+        buf = alloc(out.shape, out.device, key=_uid("grad"))
         buf.copy_(out)
         return buf
     return out.to(_DTYPE)
@@ -1129,20 +1214,32 @@ class Laplacian:
         D = x.ndim
         dv = self._normalize_dx(dx, D, x.device, x.dtype)
 
-        if not x.is_cuda:
-            out = torch.zeros_like(x)
-            for d in range(D):
-                xp = torch.roll(x, shifts=-1, dims=d)
-                xm = torch.roll(x, shifts=1, dims=d)
-                if self.boundary != "periodic":
-                    slc0 = [slice(None)] * D
-                    slc0[d] = 0
-                    slc1 = [slice(None)] * D
-                    slc1[d] = -1
-                    xp[tuple(slc1)] = x[tuple(slc1)]
-                    xm[tuple(slc0)] = x[tuple(slc0)]
-                out.add_((xp + xm - 2.0 * x) / (dv[d] * dv[d]))
-            return out
+        if x.is_cuda and D == 3 and self.boundary == "periodic":
+            try:
+                x_c = x.contiguous()
+                out = torch.empty_like(x_c)
+                nx, ny, nz = x_c.shape
+                if nx < 1 or ny < 1 or nz < 1:
+                    raise ValueError("Empty dimension")
+                BLOCK_X, BLOCK_Y, BLOCK_Z = 8, 8, 8
+                grid = (
+                    triton.cdiv(nx, BLOCK_X),
+                    triton.cdiv(ny, BLOCK_Y),
+                    triton.cdiv(nz, BLOCK_Z),
+                )
+                laplacian_3d_kernel[grid](
+                    x_c, out,
+                    nx, ny, nz,
+                    float(dv[0] * dv[0]),
+                    float(dv[1] * dv[1]),
+                    float(dv[2] * dv[2]),
+                    True,  
+                    BLOCK_X=BLOCK_X, BLOCK_Y=BLOCK_Y, BLOCK_Z=BLOCK_Z,
+                )
+                torch.cuda.synchronize()   
+                return out
+            except Exception:
+                pass
 
         out = torch.zeros_like(x)
         for d in range(D):
@@ -1353,7 +1450,16 @@ def _simpson_1d(y: torch.Tensor, dx: float, dim: int) -> torch.Tensor:
     if n < 3:
         return torch.trapezoid(y, dx=dx, dim=dim)
     if n % 2 == 0:
-        return (_simpson_1d(y.narrow(dim, 0, n - 1), dx, dim) + torch.trapezoid(y.narrow(dim, n - 2, 2), dx=dx, dim=dim))
+        fst  = y.select(dim, 0)
+        mid  = y.select(dim, n - 2)   
+        lst  = y.select(dim, n - 1)
+        odd_idx = torch.arange(1, n - 2, 2, device=y.device)
+        evn_idx = torch.arange(2, n - 2, 2, device=y.device)
+        odd = y.index_select(dim, odd_idx).sum(dim) if odd_idx.numel() > 0 else torch.zeros_like(fst)
+        evn = y.index_select(dim, evn_idx).sum(dim) if evn_idx.numel() > 0 else torch.zeros_like(fst)
+        simp = (dx / 3.0) * (fst + mid + 4.0 * odd + 2.0 * evn)
+        trap = (dx * 0.5) * (mid + lst)
+        return simp + trap
     odd_idx = torch.arange(1, n - 1, 2, device=y.device)
     evn_idx = torch.arange(2, n - 1, 2, device=y.device)
     fst = y.select(dim, 0)
@@ -1632,9 +1738,14 @@ class LazyField:
         self.dataset_name = dataset_name
         self._file: Optional[h5py.File] = None
         self._dset: Optional[h5py.Dataset] = None
+        self._lock = threading.RLock()  
 
     def _ensure_open(self) -> None:
-        if self._file is None:
+        if self._file is not None:
+            return
+        with self._lock:
+            if self._file is not None:
+                return
             self._file = h5py.File(self.path, "r")
             for cand in (self.dataset_name, "data", "field"):
                 if cand in self._file and isinstance(self._file[cand], h5py.Dataset):
@@ -1650,25 +1761,30 @@ class LazyField:
 
     @property
     def shape(self) -> Tuple:
-        self._ensure_open()
-        return self._dset.shape
+        with self._lock:
+            self._ensure_open()
+            return self._dset.shape
 
     @property
     def dtype(self) -> type:
         return np.float64
 
     def __getitem__(self, idx: Any) -> np.ndarray:
-        self._ensure_open()
-        return self._dset[idx]
+        with self._lock:
+            self._ensure_open()
+            return self._dset[idx]
+        
 
     def close(self) -> None:
-        if self._file is not None:
-            try:
-                self._file.close()
-            except Exception:
-                pass
-            self._file = None
-            self._dset = None
+        with self._lock:
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+                finally:
+                    self._file = None
+                    self._dset = None
 
     def __del__(self) -> None:
         self.close()
