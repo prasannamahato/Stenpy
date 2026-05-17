@@ -1736,58 +1736,67 @@ class LazyField:
     def __init__(self, path: str, dataset_name: str = "field") -> None:
         self.path = path
         self.dataset_name = dataset_name
-        self._file: Optional[h5py.File] = None
-        self._dset: Optional[h5py.Dataset] = None
-        self._lock = threading.RLock()  
+        self._lock = threading.RLock()
+        self._local = threading.local()  # Each thread gets own file handle
 
     def _ensure_open(self) -> None:
-        if self._file is not None:
-            return
-        with self._lock:
-            if self._file is not None:
-                return
-            self._file = h5py.File(self.path, "r")
+        """Open file handle in thread-local storage (h5py requires this)"""
+        if not hasattr(self._local, 'file') or self._local.file is None:
+            self._local.file = h5py.File(self.path, "r")
+            self._local.dset = None
+            
+            # Find dataset
             for cand in (self.dataset_name, "data", "field"):
-                if cand in self._file and isinstance(self._file[cand], h5py.Dataset):
-                    self._dset = self._file[cand]
+                if cand in self._local.file and isinstance(self._local.file[cand], h5py.Dataset):
+                    self._local.dset = self._local.file[cand]
                     break
-            if self._dset is None:
-                for k in self._file:
-                    if isinstance(self._file[k], h5py.Dataset):
-                        self._dset = self._file[k]
+            
+            if self._local.dset is None:
+                for k in self._local.file:
+                    if isinstance(self._local.file[k], h5py.Dataset):
+                        self._local.dset = self._local.file[k]
                         break
-            if self._dset is None:
+            
+            if self._local.dset is None:
                 raise KeyError(f"No array dataset found in {self.path}")
 
     @property
     def shape(self) -> Tuple:
         with self._lock:
             self._ensure_open()
-            return self._dset.shape
+            return self._local.dset.shape
 
     @property
     def dtype(self) -> type:
         return np.float64
 
     def __getitem__(self, idx: Any) -> np.ndarray:
+        """Thread-safe read from HDF5"""
         with self._lock:
             self._ensure_open()
-            return self._dset[idx]
-        
+            return self._local.dset[idx]
 
     def close(self) -> None:
-        with self._lock:
-            if self._file is not None:
-                try:
-                    self._file.close()
-                except Exception:
-                    pass
-                finally:
-                    self._file = None
-                    self._dset = None
+        """Close file handle in current thread"""
+        if hasattr(self._local, 'file') and self._local.file is not None:
+            try:
+                self._local.file.close()
+            except Exception:
+                pass
+            finally:
+                self._local.file = None
+                self._local.dset = None
 
     def __del__(self) -> None:
         self.close()
+
+    def __repr__(self) -> str:
+        try:
+            sh = self.shape
+        except Exception:
+            sh = "?"
+        return f"LazyField(path={self.path}, shape={sh}, fp64)"
+
 
 
 def _open_hdf5_field(path: str) -> Tuple[h5py.Dataset, Tuple[int, ...]]:
