@@ -1457,7 +1457,6 @@ def _hdf5_direct_chunked_run(
         if device.type == "cuda":
             print(f"  {_vram_bar(device)}")
 
-    # ========== PROBE: Compile expression on small sample ==========
     probe_rows = min(8, total_rows)
     probe_fmap: Dict[str, torch.Tensor] = dict(scalar_map)
     for name, ds in handles.items():
@@ -1489,7 +1488,6 @@ def _hdf5_direct_chunked_run(
         torch.cuda.empty_cache()
         _nerd(f"post-probe VRAM: {torch.cuda.memory_allocated(device)/1024**3:.3f} GB")
 
-    # ========== Setup output HDF5 file ==========
     _chunk_mm = stenpy.MemoryManager()
     _chunk_rt = stenpy.Runtime(_chunk_mm, device=str(device))
 
@@ -1611,20 +1609,15 @@ def _hdf5_direct_chunked_run(
                     torch.cuda.current_stream(device).synchronize()
                 chunk_h2d_times.append(time.perf_counter() - t_h2d_start)
 
-                # ========== FIX: Create fresh graph per chunk ==========
-                # Don't mutate base_graph! Clone it instead.
                 chunk_graph = stenpy.Graph()
                 for node_id in base_graph._order:
                     node = base_graph._nodes[node_id]
                     
-                    # Check if this node corresponds to a field input
                     field_name = next((n for n, nid in field_node_ids.items() if nid == node_id), None)
                     
                     if field_name and field_name in chunk_tensors:
-                        # Replace with current chunk tensor
                         chunk_graph.add("_constant", (), {"value": chunk_tensors[field_name]}, node_id=node_id)
                     else:
-                        # Copy node as-is
                         chunk_graph.add(node.op_name, node.input_ids, dict(node.params), node_id=node_id)
 
                 t_compute_start = time.perf_counter()
