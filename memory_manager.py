@@ -385,6 +385,11 @@ class PinnedPool:
         self._lock       = threading.RLock()
         self._numa_node  = 0
 
+    def clear(self) -> None:
+        with self._lock:
+            self._free.clear()
+            self._used_bytes = 0
+
     def set_numa_node(self, node: int) -> None:
         self._numa_node = node
         _pin_thread_to_numa_node(node)
@@ -557,8 +562,8 @@ class EvictionPolicy:
             with self._hlock:
                 self._heap.push(key, score)
 
-    def select_victim(self, live: Dict[str, BufferState], needed_bytes: int) -> Optional[str]:
-        def _eligible(state: BufferState) -> bool:
+    def select_victim(self, live: Dict[str, "BufferState"], needed_bytes: int) -> Optional[str]:
+        def _eligible(state: "BufferState") -> bool:
             return (
                 not state.is_free
                 and state.tensor is not None
@@ -572,43 +577,33 @@ class EvictionPolicy:
                     return key
             return None
 
-        elif self.policy == "lru_size":
-            now = time.monotonic()
-            with self._hlock:
-                for key, state in live.items():
-                    if _eligible(state):
-                        score = -state.size_bytes
-                        self._heap.push(key, score)
-                return self._heap.pop_valid()
+        if self.policy == "lru_size":
+            best_key, best_score = None, float("-inf")
+            for key, state in live.items():
+                if _eligible(state):
+                    score = state.size_bytes
+                    if score > best_score:
+                        best_score, best_key = score, key
+            return best_key
 
-        elif self.policy == "lru_freq":
+        if self.policy == "lru_freq":
             now = time.monotonic()
-            with self._hlock:
-                for key, state in live.items():
-                    if _eligible(state):
-                        recency = 1.0 / (now - state.last_access + 1e-9)
-                        score   = state.access_count * 0.7 + recency * 0.3
-                        self._heap.push(key, score)
-                while True:
-                    key = self._heap.pop_valid()
-                    if key is None:
-                        return None
-                    state = live.get(key)
-                    if state and _eligible(state):
-                        return key
+            best_key, best_score = None, float("inf")
+            for key, state in live.items():
+                if not _eligible(state):
+                    continue
+                recency = 1.0 / (now - state.last_access + 1e-9)
+                score   = state.access_count * 0.7 + recency * 0.3
+                if score < best_score:
+                    best_score, best_key = score, key
+            return best_key
 
-        elif self.policy == "largest_first":
-            with self._hlock:
-                for key, state in live.items():
-                    if _eligible(state):
-                        self._heap.push(key, -state.size_bytes)
-                while True:
-                    key = self._heap.pop_valid()
-                    if key is None:
-                        return None
-                    state = live.get(key)
-                    if state and _eligible(state):
-                        return key
+        if self.policy == "largest_first":
+            best_key, best_score = None, -1
+            for key, state in live.items():
+                if _eligible(state) and state.size_bytes > best_score:
+                    best_score, best_key = state.size_bytes, key
+            return best_key
 
         return None
 
@@ -931,20 +926,28 @@ class MemoryManager:
 
             state = self._live.get(key)
             if state is not None and state.tensor is not None:
-                deadline = time.monotonic() + 5.0
-                while key in self._pending_writes:
-                    remaining = max(0.0, deadline - time.monotonic())
-                    if remaining == 0.0:
-                        break
-                    self._pending_writes_cond.wait(timeout=remaining)
-                state.last_access   = time.monotonic()
-                state.access_count += 1
-                self.eviction.touch(key)
-                if self._telemetry:
-                    self._telemetry.inc("allocation_hits")
-                event_to_wait    = state.copy_event
-                state.copy_event = None
-                return_tensor    = state.tensor
+                if state.shape != tuple(shape) or state.dtype != dtype or state.device != device:
+                    warnings.warn(
+                        f"get_buffer: key '{key}' reused with different "
+                        f"shape/dtype/device ({state.shape} {state.dtype} {state.device} "
+                        f"→ {tuple(shape)} {dtype} {device}). Evicting old buffer."
+                    )
+                    self._evict_buffer(key, keep_metadata=False)
+                else:
+                    deadline = time.monotonic() + 5.0
+                    while key in self._pending_writes:
+                        remaining = max(0.0, deadline - time.monotonic())
+                        if remaining == 0.0:
+                            break
+                        self._pending_writes_cond.wait(timeout=remaining)
+                    state.last_access   = time.monotonic()
+                    state.access_count += 1
+                    self.eviction.touch(key)
+                    if self._telemetry:
+                        self._telemetry.inc("allocation_hits")
+                    event_to_wait    = state.copy_event
+                    state.copy_event = None
+                    return_tensor    = state.tensor
             elif state is not None and state.on_disk:
                 disk_gen = state.spill_generation
             else:
@@ -1289,13 +1292,17 @@ class MemoryManager:
         return {}
 
     def clear_pool(self) -> None:
-            with self._pool_lock:
-                self._device_pools.clear()
-            total_ram = psutil.virtual_memory().total if _HAS_PSUTIL else 16 * 1024**3
-            self.pinned_pool = PinnedPool(
-                int(total_ram * self.cpu_pressure_high),
-                pool_depth=self._pool_depth,
-            )
+        with self._pool_lock:
+            self._device_pools.clear()
+        try:
+            self.pinned_pool.clear()
+        except Exception as e:
+            warnings.warn(f"Error clearing pinned pool: {e}")
+        total_ram = psutil.virtual_memory().total if _HAS_PSUTIL else 16 * 1024 ** 3
+        self.pinned_pool = PinnedPool(
+            int(total_ram * self.cpu_pressure_high),
+            pool_depth=self._pool_depth,
+        )
 
     def __repr__(self) -> str:
         with self._live_lock:
