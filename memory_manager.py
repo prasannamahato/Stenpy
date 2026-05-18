@@ -425,26 +425,20 @@ class PinnedPool:
         return backing[:numel].view(shape).zero_()
 
     def release(self, buf: torch.Tensor) -> None:
-        if buf is None:
-            return
-        stored     = buf.clone()
-        numel      = stored.numel()
-        bucket     = self._bucket(numel)
-        key        = (bucket, stored.dtype)
-        if numel < bucket // 2:
-            bucket = numel
-            key    = (bucket, stored.dtype)
-        size_bytes = stored.numel() * stored.element_size()
-        with self._lock:
-            if key not in self._free:
-                self._free[key] = []
-            self._free[key].append(stored)
-            self._used_bytes += size_bytes
-            if len(self._free[key]) > self._pool_depth:
-                old = self._free[key].pop(0)
-                self._used_bytes -= old.numel() * old.element_size()
-            if self._used_bytes > self.max_bytes:
-                self._evict(self._used_bytes - self.max_bytes)
+            if buf is None:
+                return
+            numel      = buf.numel()
+            bucket     = self._bucket(numel)
+            key        = (bucket, buf.dtype)
+            size_bytes = numel * buf.element_size()
+            with self._lock:
+                if key not in self._free:
+                    self._free[key] = []
+                if len(self._free[key]) < self._pool_depth:
+                    self._free[key].append(buf)
+                    self._used_bytes += size_bytes
+                if self._used_bytes > self.max_bytes:
+                    self._evict(self._used_bytes - self.max_bytes)
 
     def _evict(self, needed_bytes: int) -> None:
         freed = 0
@@ -1289,25 +1283,19 @@ class MemoryManager:
     def all_reduce_sum(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
     def stats(self) -> Dict[str, int]:
         if self._telemetry:
             return self._telemetry.snapshot()
         return {}
 
     def clear_pool(self) -> None:
-        with self._pool_lock:
-            self._device_pools.clear()
-        total_ram = psutil.virtual_memory().total if _HAS_PSUTIL else 16 * 1024**3
-        self.pinned_pool = PinnedPool(int(total_ram * self.cpu_pressure_high), pool_depth=self._pool_depth)
-        if hasattr(self, "spill_mgr") and self.spill_mgr is not None:
-            self.spill_mgr.shutdown()
-        self.spill_mgr = SpillManager(
-            SPILL_DIR, MAX_SPILL_BYTES, BACKPRESSURE_QUEUE,
-            self._on_spill_file_deleted, self._on_spill_write_complete,
-        )
+            with self._pool_lock:
+                self._device_pools.clear()
+            total_ram = psutil.virtual_memory().total if _HAS_PSUTIL else 16 * 1024**3
+            self.pinned_pool = PinnedPool(
+                int(total_ram * self.cpu_pressure_high),
+                pool_depth=self._pool_depth,
+            )
 
     def __repr__(self) -> str:
         with self._live_lock:
