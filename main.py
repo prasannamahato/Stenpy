@@ -1,5 +1,3 @@
-#mains.py
-
 from __future__ import annotations
 import argparse
 import datetime
@@ -17,6 +15,7 @@ from queue import Queue, Empty as _QueueEmpty
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
+import gc
 
 try:
     from tqdm import tqdm as _tqdm
@@ -31,15 +30,7 @@ try:
 except ImportError:
     sys.exit("SymPy is required: pip install sympy")
 
-try:
-    import sympy as sp
-    from sympy import Function, Symbol, Add, Mul, Pow
-    from sympy.core.function import AppliedUndef, UndefinedFunction
-except ImportError:
-    sys.exit("SymPy is required: pip install sympy")
-
 def _dbg(msg: str) -> None:
-    """Debug print if OPS_DEBUG env var is set."""
     if os.environ.get("OPS_DEBUG", "0") == "1":
         print(f"[DEBUG] {msg}")
 
@@ -48,36 +39,34 @@ try:
 except ImportError:
     sys.exit("sten.py not found — place it in the same directory as main.py")
 
-try:
-    import stenpy
-except ImportError:
-    sys.exit("sten.py not found — place it in the same directory as main.py")
-
 import h5py as _h5py
+
+
+_CHUNK_VRAM_FRACTION  = float(os.environ.get("OPS_CHUNK_VRAM_FRAC",  "0.18"))
+_CHUNK_RAM_FRACTION   = float(os.environ.get("OPS_CHUNK_RAM_FRAC",   "0.12"))
+_VRAM_SHRINK_TRIGGER  = float(os.environ.get("OPS_VRAM_SHRINK",      "0.70")) 
+_RAM_SHRINK_TRIGGER   = float(os.environ.get("OPS_RAM_SHRINK",       "0.65"))
+
+_MIN_CHUNK_ROWS = int(os.environ.get("OPS_MIN_CHUNK_ROWS", "1"))
+_MAX_CHUNK_FRAC = float(os.environ.get("OPS_MAX_CHUNK_FRAC", "0.125"))
+
 
 # ----------------------------------------------------------------------
 # HPC environment detection
 # ----------------------------------------------------------------------
 
 _HPC_RANK_VARS = (
-    "SLURM_PROCID",
-    "PMI_RANK",
-    "OMPI_COMM_WORLD_RANK",
-    "MPI_RANK",
-    "MV2_COMM_WORLD_RANK",
-    "JSM_NAMESPACE_RANK",
+    "SLURM_PROCID", "PMI_RANK", "OMPI_COMM_WORLD_RANK",
+    "MPI_RANK", "MV2_COMM_WORLD_RANK", "JSM_NAMESPACE_RANK",
 )
-
 _IS_HPC: bool = any(k in os.environ for k in _HPC_RANK_VARS)
 
 def _env_rank() -> int:
     for k in _HPC_RANK_VARS:
         v = os.environ.get(k)
         if v is not None:
-            try:
-                return int(v)
-            except ValueError:
-                pass
+            try: return int(v)
+            except ValueError: pass
     return 0
 
 def _env_world() -> int:
@@ -85,10 +74,8 @@ def _env_world() -> int:
               "MPI_WORLD_SIZE", "MV2_COMM_WORLD_SIZE"):
         v = os.environ.get(k)
         if v is not None:
-            try:
-                return max(1, int(v))
-            except ValueError:
-                pass
+            try: return max(1, int(v))
+            except ValueError: pass
     return 1
 
 _HPC_RANK:  int = _env_rank()
@@ -111,39 +98,29 @@ def _hpc_scratch() -> str:
 
 class _FallbackBar:
     def __init__(self, total=None, desc="", unit="", **kw):
-        self.total = total or 0
-        self.n     = 0
-        self.desc  = desc
-        self._t0   = time.perf_counter()
+        self.total = total or 0; self.n = 0; self.desc = desc
+        self._t0 = time.perf_counter()
         _rank0_print(f"  {desc} …")
-
     def update(self, n=1):
         self.n += n
-        pct     = 100 * self.n / self.total if self.total else 0
+        pct = 100 * self.n / self.total if self.total else 0
         elapsed = time.perf_counter() - self._t0
         if not _IS_HPC or _HPC_RANK == 0:
-            print(f"\r  {self.desc}  {pct:5.1f}%  [{elapsed:.1f}s]",
-                  end="", flush=True)
-
+            print(f"\r  {self.desc}  {pct:5.1f}%  [{elapsed:.1f}s]", end="", flush=True)
     def set_postfix_str(self, s, **kw): pass
-    def set_postfix(self, **kw):        pass
+    def set_postfix(self, **kw): pass
     def close(self):
-        if not _IS_HPC or _HPC_RANK == 0:
-            print()
-    def __enter__(self):  return self
+        if not _IS_HPC or _HPC_RANK == 0: print()
+    def __enter__(self): return self
     def __exit__(self, *a): self.close()
 
 def _make_bar(total, desc="", unit="chunk", colour=None):
     if HAS_TQDM and (not _IS_HPC or _HPC_RANK == 0):
-        return _tqdm(
-            total         = total,
-            desc          = f"  {desc}",
-            unit          = unit,
-            dynamic_ncols = True,
-            colour        = colour or "cyan",
-            bar_format    = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
-        )
+        return _tqdm(total=total, desc=f"  {desc}", unit=unit, dynamic_ncols=True,
+                     colour=colour or "cyan",
+                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}")
     return _FallbackBar(total=total, desc=desc, unit=unit)
+
 
 # ----------------------------------------------------------------------
 # Nerd mode
@@ -166,26 +143,22 @@ def _vram_bar(device: torch.device, width: int = 28) -> str:
         return "CPU — no VRAM gauge"
     props = torch.cuda.get_device_properties(device)
     total = props.total_memory
-    if total <= 0:                          
-        return "VRAM total unavailable"
+    if total <= 0: return "VRAM total unavailable"
     used  = torch.cuda.memory_allocated(device)
     peak  = torch.cuda.max_memory_allocated(device)
-    frac  = max(0.0, min(1.0, used / total))   
-    pfrac = max(0.0, min(1.0, peak / total))   
+    frac  = max(0.0, min(1.0, used / total))
+    pfrac = max(0.0, min(1.0, peak / total))
     fi    = min(int(frac  * width), width)
     pi    = min(int(pfrac * width), width)
-    bar   = "█" * fi + "▒" * max(0, pi - fi) + "░" * max(0, width - max(fi, pi))  
+    bar   = "█" * fi + "▒" * max(0, pi - fi) + "░" * max(0, width - max(fi, pi))
     pct   = frac * 100
     return (f"[{bar}] {used/1024**3:.2f}/{total/1024**3:.2f} GB  "
             f"{pct:.0f}%{_sev_label(pct)}")
 
 def _hdf5_dissect(path: str) -> None:
-    if not _NERD:
-        return
-    try:
-        disk_mb = os.path.getsize(path) / 1024**2
-    except OSError:
-        disk_mb = 0.0
+    if not _NERD: return
+    try: disk_mb = os.path.getsize(path) / 1024**2
+    except OSError: disk_mb = 0.0
     _rank0_print(f"\n  ┌─── HDF5 dissection ─────────────────────────────────────────")
     _rank0_print(f"  │  file      : {Path(path).name}")
     _rank0_print(f"  │  disk size : {disk_mb:.2f} MB")
@@ -196,14 +169,13 @@ def _hdf5_dissect(path: str) -> None:
                 for k, v in f.attrs.items():
                     _rank0_print(f"  │    {k} = {v}")
             def _visit(name: str, obj: Any) -> None:
-                if not isinstance(obj, _h5py.Dataset):
-                    return
-                nbytes   = obj.dtype.itemsize * int(np.prod(obj.shape))
-                stored   = obj.id.get_storage_size()
-                ratio    = stored / max(nbytes, 1)
-                comp     = obj.compression or "none"
+                if not isinstance(obj, _h5py.Dataset): return
+                nbytes = obj.dtype.itemsize * int(np.prod(obj.shape))
+                stored = obj.id.get_storage_size()
+                ratio  = stored / max(nbytes, 1)
+                comp   = obj.compression or "none"
                 comp_lvl = f"/{obj.compression_opts}" if obj.compression_opts is not None else ""
-                ram_gb   = nbytes / 1024**3
+                ram_gb = nbytes / 1024**3
                 _rank0_print(f"  │  /{name}")
                 _rank0_print(f"  │    shape      : {tuple(obj.shape)}")
                 _rank0_print(f"  │    dtype      : {obj.dtype}")
@@ -219,6 +191,11 @@ def _hdf5_dissect(path: str) -> None:
         _rank0_print(f"  │  [error reading HDF5: {exc}]")
     _rank0_print(f"  └─────────────────────────────────────────────────────────────")
 
+def _nerd(msg: str) -> None:
+    if _NERD and (not _IS_HPC or _HPC_RANK == 0):
+        print(f"  ○  {msg}")
+
+
 def _budget_explain(
     full_shape:  Tuple[int, ...],
     device:      torch.device,
@@ -226,38 +203,33 @@ def _budget_explain(
     chunk_rows:  int,
     n_chunks:    int,
 ) -> None:
-    if not _NERD:
-        return
+    if not _NERD: return
     row_bytes = math.prod(full_shape[1:]) * 8
     dim0      = full_shape[0]
-    cap       = max(1, dim0 // 4)
+    cap       = max(1, int(dim0 * _MAX_CHUNK_FRAC))
     _rank0_print(f"\n  ┌─── Chunk budget ─────────────────────────────────────────────")
     if device.type == "cuda" and torch.cuda.is_available():
-        props     = torch.cuda.get_device_properties(device)
-        total     = props.total_memory
-        used      = torch.cuda.memory_allocated(device)
-        free      = max(0, total - used)    
-        budget_pf = int(free * _CHUNK_VRAM_FRACTION) // max(n_fields, 1)
-        raw_rows  = max(1, budget_pf // max(row_bytes, 1))
-        _rank0_print(f"  │  free VRAM          : {free/1024**3:.3f} GB")
+        free_vram  = _free_vram_bytes(device)
+        free_ram   = _free_ram_bytes()
+        _rank0_print(f"  │  free VRAM          : {free_vram/1024**3:.3f} GB")
+        _rank0_print(f"  │  free RAM           : {free_ram/1024**3:.3f} GB")
         _rank0_print(f"  │  VRAM fraction      : {_CHUNK_VRAM_FRACTION:.0%}")
-        _rank0_print(f"  │  budget / field     : {budget_pf/1024**2:.1f} MB")
-        _rank0_print(f"  │  row size           : {row_bytes/1024**2:.3f} MB  "
-              f"({math.prod(full_shape[1:])} elements × 8 B)")
-        _rank0_print(f"  │  raw rows           : {raw_rows}")
-        _rank0_print(f"  │  dim-0 cap (÷4)     : {cap}")
+        _rank0_print(f"  │  RAM  fraction      : {_CHUNK_RAM_FRACTION:.0%}")
+        _rank0_print(f"  │  row size (input)   : {row_bytes/1024**2:.3f} MB  "
+                     f"({math.prod(full_shape[1:])} elements × 8 B)")
+        _rank0_print(f"  │  dim-0 cap ({_MAX_CHUNK_FRAC:.0%})    : {cap}")
     else:
+        free_ram = _free_ram_bytes()
         _rank0_print(f"  │  device             : CPU")
+        _rank0_print(f"  │  free RAM           : {free_ram/1024**3:.3f} GB")
         _rank0_print(f"  │  row size           : {row_bytes/1024**2:.3f} MB")
     _rank0_print(f"  │  ──────────────────────────────────────────────────────────")
-    _rank0_print(f"  │  chunk_rows         : {chunk_rows}  "
-          f"({chunk_rows * row_bytes * n_fields / 1024**3:.3f} GB / iter)")
-    _rank0_print(f"  │  n_chunks           : {n_chunks}  (dim-0 {dim0} rows)")
+    _rank0_print(f"  │  chunk_rows (initial): {chunk_rows}  "
+                 f"({chunk_rows * row_bytes * n_fields / 1024**3:.3f} GB input / iter)")
+    _rank0_print(f"  │  n_chunks            : {n_chunks}  (dim-0 {dim0} rows)")
+    _rank0_print(f"  │  adaptive shrinking  : ON (triggers at "
+                 f"VRAM>{_VRAM_SHRINK_TRIGGER:.0%} / RAM>{_RAM_SHRINK_TRIGGER:.0%})")
     _rank0_print(f"  └─────────────────────────────────────────────────────────────")
-
-def _nerd(msg: str) -> None:
-    if _NERD and (not _IS_HPC or _HPC_RANK == 0):
-        print(f"  ○  {msg}")
 
 # ----------------------------------------------------------------------
 # Performance instrumentation
@@ -1144,96 +1116,52 @@ def compile_expression(
 # ----------------------------------------------------------------------
 
 def _tensor_gb(shape: Tuple) -> float:
-    try:
-        return math.prod(int(s) for s in shape) * 8 / 1024**3
-    except Exception:
-        return 0.0
+    try: return math.prod(int(s) for s in shape) * 8 / 1024**3
+    except Exception: return 0.0
 
 def _gpu_free_gb(device: torch.device) -> float:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return float("inf")
-    props = torch.cuda.get_device_properties(device)
-    return max(0.0, props.total_memory - torch.cuda.memory_allocated(device)) / 1024**3
-
+    if device.type != "cuda" or not torch.cuda.is_available(): return float("inf")
+    return _free_vram_bytes(device) / 1024**3
 
 def _select_device() -> torch.device:
     if not torch.cuda.is_available():
-        print("  Device: CPU  (no CUDA GPU found)")
-        return torch.device("cpu")
+        print("  Device: CPU  (no CUDA GPU found)"); return torch.device("cpu")
     n = torch.cuda.device_count()
-    print(f"\n  {'─'*62}")
-    print("  SELECT COMPUTE DEVICE")
-    print(f"  {'─'*62}")
+    print(f"\n  {'─'*62}\n  SELECT COMPUTE DEVICE\n  {'─'*62}")
     print("    [0]  CPU")
     for i in range(n):
         p = torch.cuda.get_device_properties(i)
-        print(f"    [{i+1}]  CUDA:{i}  {p.name}  "
-              f"{p.total_memory/1024**3:.1f} GB VRAM  "
-              f"{p.multi_processor_count} SMs")
+        print(f"    [{i+1}]  CUDA:{i}  {p.name}  {p.total_memory/1024**3:.1f} GB VRAM  {p.multi_processor_count} SMs")
     print(f"  {'─'*62}")
     while True:
-        try:
-            raw = input("  Choice [0 = CPU]: ").strip() or "0"
-        except (EOFError, KeyboardInterrupt):
-            return torch.device("cpu")
-        try:
-            idx = int(raw)
-        except ValueError:
-            print(f"  ✗ Enter 0–{n}"); continue
-        if idx == 0:
-            return torch.device("cpu")
-        if 1 <= idx <= n:
-            return torch.device(f"cuda:{idx - 1}")
+        try: raw = input("  Choice [0 = CPU]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt): return torch.device("cpu")
+        try: idx = int(raw)
+        except ValueError: print(f"  ✗ Enter 0–{n}"); continue
+        if idx == 0: return torch.device("cpu")
+        if 1 <= idx <= n: return torch.device(f"cuda:{idx - 1}")
         print(f"  ✗ Enter 0–{n}")
 
 def _select_device_hpc() -> torch.device:
-    if not torch.cuda.is_available():
-        return torch.device("cpu")
-    
+    if not torch.cuda.is_available(): return torch.device("cpu")
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0: return torch.device("cpu")
     local_rank = None
-    hpc_vars = [
-        "SLURM_LOCALID",               
-        "OMPI_COMM_WORLD_LOCAL_RANK",    
-        "PMI_LOCAL_RANK",              
-        "JSM_NAMESPACE_LOCAL_RANK",        
-        "MPI_LOCALRANKID",              
-    ]
-    
-    for var_name in hpc_vars:
+    for var_name in ("SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
+                     "PMI_LOCAL_RANK", "JSM_NAMESPACE_LOCAL_RANK", "MPI_LOCALRANKID"):
         val = os.environ.get(var_name)
         if val is not None:
-            try:
-                local_rank = int(val.strip())
-                _dbg(f"_select_device_hpc: Using {var_name}={local_rank}")
-                break
-            except (ValueError, TypeError, AttributeError):
-                continue
-    
+            try: local_rank = int(val.strip()); break
+            except (ValueError, TypeError): continue
     if local_rank is None:
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-        if visible and visible != "-1":
+        if visible and visible not in ("-1", ""):
             try:
-                gpu_ids = [int(x.strip()) for x in visible.split(",") if x.strip()]
-                if gpu_ids:
-                    local_rank = 0  # Use first visible GPU
-                    _dbg(f"_select_device_hpc: Using CUDA_VISIBLE_DEVICES, local_rank=0")
-            except (ValueError, AttributeError):
-                pass
-    
-    if local_rank is None:
-        local_rank = 0
-        _dbg("_select_device_hpc: No HPC env vars found, defaulting to local_rank=0")
-    
-    n_gpus = torch.cuda.device_count()
-    if n_gpus == 0:
-        return torch.device("cpu")
-    
-    selected_gpu = local_rank % n_gpus
-    device = torch.device(f"cuda:{selected_gpu}")
-    _dbg(f"_select_device_hpc: Assigned local_rank={local_rank} → cuda:{selected_gpu} ({n_gpus} GPUs total)")
-    
-    return device
-
+                ids = [x.strip() for x in visible.split(",") if x.strip()]
+                if ids: local_rank = _HPC_RANK % len(ids)
+            except Exception: pass
+    if local_rank is None: local_rank = _HPC_RANK % n_gpus
+    return torch.device(f"cuda:{local_rank % n_gpus}")
 
 def _select_boundary() -> str:
     opts = {"1": "neumann", "2": "dirichlet", "3": "periodic", "4": "reflect"}
@@ -1242,12 +1170,9 @@ def _select_boundary() -> str:
     print("    [2]  Dirichlet  — zero pad")
     print("    [3]  Periodic   — wrap around")
     print("    [4]  Reflect")
-    try:
-        raw = input("  Choice [1]: ").strip() or "1"
-    except (EOFError, KeyboardInterrupt):
-        return "neumann"
+    try: raw = input("  Choice [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt): return "neumann"
     return opts.get(raw, "neumann")
-
 
 # ----------------------------------------------------------------------
 # VRAM management
@@ -1328,27 +1253,37 @@ def _merge_domain(
 # GPU-saturating direct-HDF5 chunked executor
 # ----------------------------------------------------------------------
 
-_CHUNK_VRAM_FRACTION = 0.12
-_PIPELINE_DEPTH      = 2
+_CHUNK_VRAM_FRACTION = 0.6
+_PIPELINE_DEPTH      = 0
 
-def _compute_chunk_rows(
-    full_shape: Tuple[int, ...],
-    device:     torch.device,
-    n_fields:   int = 1,
-) -> int:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        row_bytes = math.prod(full_shape[1:]) * 8
-        return max(1, (256 * 1024 * 1024) // max(row_bytes, 1))
+def _free_ram_bytes() -> int:
     try:
-        props     = torch.cuda.get_device_properties(device)
-        free_vram = max(0, props.total_memory - torch.cuda.memory_allocated(device))
-        budget    = int(free_vram * _CHUNK_VRAM_FRACTION) // max(n_fields, 1)
-        row_bytes = math.prod(full_shape[1:]) * 8
-        rows      = max(1, budget // max(row_bytes, 1))
-        rows      = min(rows, max(1, full_shape[0] // 4))
-        return rows
+        import psutil
+        return int(psutil.virtual_memory().available)
     except Exception:
-        return max(1, full_shape[0] // 16)
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 512 * 1024 * 1024   
+
+
+def _free_vram_bytes(device: torch.device) -> int:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 0
+    props = torch.cuda.get_device_properties(device)
+
+    reserved   = torch.cuda.memory_reserved(device)
+    allocated  = torch.cuda.memory_allocated(device)
+
+    reclaimable = (reserved - allocated) // 2
+    free = props.total_memory - reserved + reclaimable
+    return max(0, free)
+
 
 def _open_hdf5_field(path: str) -> Tuple[_h5py.Dataset, Tuple[int, ...]]:
     f   = _h5py.File(path, "r")
@@ -1373,13 +1308,106 @@ def _graph_multi_replace(
     return g
 
 
+_STREAM_GLOBAL_OPS: Set[str] = {
+    "norm_l2", "min_max", "covariance", "correlation", "surface_integral",
+    "fft", "ifft", "spectral_gradient", "spectral_laplacian",
+    "distance_transform",
+}
+
+def _dim_mentions_chunk_dim(value: Any, chunk_dim: int = 0) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (tuple, list, set)):
+        return any(_dim_mentions_chunk_dim(v, chunk_dim) for v in value)
+    try:
+        return int(value) == chunk_dim
+    except (TypeError, ValueError):
+        return True
+
+def _stream_unsafe_reason(node: Any, chunk_dim: int = 0) -> Optional[str]:
+    op = node.op_name
+    if op in _STREAM_GLOBAL_OPS:
+        return f"{op} needs global data, not independent HDF5 chunks"
+    if op in {"sum", "mean", "variance", "entropy"}:
+        if _dim_mentions_chunk_dim(node.params.get("dim"), chunk_dim):
+            return f"{op} reduces across the streamed dimension"
+    if op == "integrate":
+        if _dim_mentions_chunk_dim(node.params.get("dims"), chunk_dim):
+            return "integrate reduces across the streamed dimension"
+    if op == "cumulative_integral":
+        if _dim_mentions_chunk_dim(node.params.get("dim", 0), chunk_dim):
+            return "cumulative_integral needs state across chunks"
+    return None
+
+def _node_row_halo(node: Any, chunk_dim: int = 0) -> int:
+    meta = stenpy.OP_METADATA.get(node.op_name, {})
+    radius = int(meta.get("stencil_radius", 0) or 0)
+    if radius <= 0:
+        return 0
+    exchange_dims = meta.get("exchange_dims")
+    if exchange_dims is None or chunk_dim in exchange_dims:
+        return radius
+    return 0
+
+def _graph_row_halo(graph: stenpy.Graph, sink_id: str, chunk_dim: int = 0) -> int:
+    memo: Dict[str, int] = {}
+
+    def _walk(node_id: str) -> int:
+        if node_id in memo:
+            return memo[node_id]
+        node = graph._nodes[node_id]
+        reason = _stream_unsafe_reason(node, chunk_dim=chunk_dim)
+        if reason is not None:
+            raise ValueError(
+                f"Expression is not safe for direct chunk streaming: {reason}. "
+                "Use an eager/small input path, or rewrite as a local stencil/elementwise expression."
+            )
+        child_halo = max((_walk(dep) for dep in node.input_ids), default=0)
+        halo = child_halo + _node_row_halo(node, chunk_dim=chunk_dim)
+        memo[node_id] = halo
+        return halo
+
+    return _walk(sink_id)
+
+def _read_halo_rows(
+    ds: "_h5py.Dataset",
+    row_start: int,
+    row_end: int,
+    halo: int,
+    periodic: bool,
+) -> Tuple[np.ndarray, int]:
+    total = int(ds.shape[0])
+    if halo <= 0:
+        return ds[row_start:row_end], 0
+    if total <= 0:
+        raise ValueError("Cannot stream an empty HDF5 dataset")
+
+    if periodic:
+        wanted = (row_end - row_start) + 2 * halo
+        parts: List[np.ndarray] = []
+        pos = row_start - halo
+        remaining = wanted
+        while remaining > 0:
+            wrapped = pos % total
+            run = min(remaining, total - wrapped)
+            parts.append(ds[wrapped:wrapped + run])
+            pos += run
+            remaining -= run
+        arr = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+        return arr, halo
+
+    read_start = max(0, row_start - halo)
+    read_end = min(total, row_end + halo)
+    return ds[read_start:read_end], row_start - read_start
+
+
 def _safe_mm_clear(mm: Any) -> None:
     try:
         mm.clear_pool()
     except Exception:
         pass
     try:
-        _lock = getattr(mm, '_lock', None)
+        _lock = getattr(mm, '_lock', None) or getattr(mm, '_live_lock', None)
         _live = getattr(mm, '_live', None)
         if _live is not None:
             if _lock is not None:
@@ -1388,14 +1416,132 @@ def _safe_mm_clear(mm: Any) -> None:
                     _pool_ptrs = getattr(mm, '_pool_ptrs', None)
                     if _pool_ptrs is not None:
                         _pool_ptrs.clear()
+                    _pending = getattr(mm, '_pending_writes', None)
+                    if _pending is not None:
+                        _pending.clear()
+                        _cond = getattr(mm, '_pending_writes_cond', None)
+                        if _cond is not None:
+                            _cond.notify_all()
             else:
                 _live.clear()
                 _pool_ptrs = getattr(mm, '_pool_ptrs', None)
                 if _pool_ptrs is not None:
                     _pool_ptrs.clear()
+        _device_pools = getattr(mm, '_device_pools', None)
+        _pool_lock = getattr(mm, '_pool_lock', None)
+        if _device_pools is not None:
+            if _pool_lock is not None:
+                with _pool_lock:
+                    _device_pools.clear()
+            else:
+                _device_pools.clear()
     except Exception:
         pass
 
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def _compute_chunk_rows(
+    full_shape:        Tuple[int, ...],
+    device:            torch.device,
+    n_fields:          int = 1,
+    output_multiplier: float = 1.0,
+    graph_overhead:    float = 3.0,  
+) -> int:
+    if len(full_shape) == 0:
+        return 1
+
+    elements_per_row = math.prod(full_shape[1:]) if len(full_shape) > 1 else 1
+    bytes_per_row_in  = elements_per_row * 8          
+    bytes_per_row_out = int(bytes_per_row_in * max(1.0, output_multiplier))
+
+    dim0     = full_shape[0]
+    hard_cap = max(_MIN_CHUNK_ROWS, int(dim0 * _MAX_CHUNK_FRAC))
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        free_vram = _free_vram_bytes(device)
+
+        vram_per_row = (
+            bytes_per_row_in  * n_fields * (1.0 + graph_overhead)
+            + bytes_per_row_out
+        )
+        vram_budget  = int(free_vram * _CHUNK_VRAM_FRACTION)
+        vram_rows    = max(_MIN_CHUNK_ROWS, int(vram_budget / max(vram_per_row, 1)))
+
+        free_ram = _free_ram_bytes()
+        ram_per_row  = (
+            bytes_per_row_in  * n_fields * 2   
+            + bytes_per_row_out              
+        )
+        ram_budget   = int(free_ram * _CHUNK_RAM_FRACTION)
+        ram_rows     = max(_MIN_CHUNK_ROWS, int(ram_budget / max(ram_per_row, 1)))
+
+        rows = min(vram_rows, ram_rows, hard_cap)
+
+        if _NERD:
+            _rank0_print(
+                f"  ○  chunk_rows: vram={vram_rows} ram={ram_rows} cap={hard_cap} → {rows}"
+                f"  (free_vram={free_vram/1024**3:.2f}GB free_ram={free_ram/1024**3:.2f}GB)"
+            )
+    else:
+        free_ram = _free_ram_bytes()
+        ram_per_row = (
+            bytes_per_row_in  * n_fields * (1.0 + graph_overhead)
+            + bytes_per_row_out * 2
+        )
+        ram_budget = int(free_ram * _CHUNK_RAM_FRACTION)
+        rows = max(_MIN_CHUNK_ROWS, min(int(ram_budget / max(ram_per_row, 1)), hard_cap))
+
+        if _NERD:
+            _rank0_print(
+                f"  ○  chunk_rows (CPU): {rows}  "
+                f"(free_ram={free_ram/1024**3:.2f}GB ram_per_row={ram_per_row/1024**2:.1f}MB)"
+            )
+
+    return max(_MIN_CHUNK_ROWS, rows)
+
+def _adapt_chunk_rows(
+    current_rows:   int,
+    full_shape:     Tuple[int, ...],
+    device:         torch.device,
+    n_fields:       int,
+    output_multiplier: float,
+) -> int:
+    elements_per_row  = math.prod(full_shape[1:]) if len(full_shape) > 1 else 1
+    bytes_per_row_in  = elements_per_row * 8
+    bytes_per_row_out = int(bytes_per_row_in * max(1.0, output_multiplier))
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        used  = torch.cuda.memory_allocated(device)
+        total = torch.cuda.get_device_properties(device).total_memory
+        pct   = used / max(total, 1)
+        if pct >= _VRAM_SHRINK_TRIGGER:
+            new_rows = _compute_chunk_rows(full_shape, device, n_fields, output_multiplier)
+            if new_rows < current_rows:
+                if _NERD or (not _IS_HPC or _HPC_RANK == 0):
+                    _rank0_print(
+                        f"\n  ▲  VRAM pressure {pct*100:.0f}% — "
+                        f"shrinking chunk_rows {current_rows} → {new_rows}"
+                    )
+                return new_rows
+    else:
+        try:
+            import psutil
+            pct = psutil.virtual_memory().percent / 100.0
+        except Exception:
+            pct = 0.0
+        if pct >= _RAM_SHRINK_TRIGGER:
+            new_rows = _compute_chunk_rows(full_shape, device, n_fields, output_multiplier)
+            if new_rows < current_rows:
+                if _NERD or (not _IS_HPC or _HPC_RANK == 0):
+                    _rank0_print(
+                        f"\n  ▲  RAM pressure {pct*100:.0f}% — "
+                        f"shrinking chunk_rows {current_rows} → {new_rows}"
+                    )
+                return new_rows
+
+    return current_rows
 
 def _hdf5_direct_chunked_run(
     expr_str:    str,
@@ -1409,14 +1555,6 @@ def _hdf5_direct_chunked_run(
     device:      torch.device,
     verbose:     bool = True,
 ) -> Dict[str, Any]:
-    """
-    Direct HDF5 streaming with chunked processing.
-    
-    FIXED: 
-    - Don't mutate base_graph._nodes during chunk loop
-    - Create fresh graph per chunk from base
-    - Thread-safe file operations
-    """
     handles:    Dict[str, "_h5py.Dataset"] = {}
     hdf5_files: List["_h5py.File"]        = []
     shapes:     Dict[str, Tuple[int, ...]] = {}
@@ -1425,14 +1563,10 @@ def _hdf5_direct_chunked_run(
         for name, path in field_paths.items():
             _hdf5_dissect(path)
             f   = _h5py.File(path, "r")
-            hdf5_files.append(f)         
-            key = next(
-                (k for k in ("data", "field") if k in f and isinstance(f[k], _h5py.Dataset)),
-                next(k for k in f if isinstance(f[k], _h5py.Dataset)),
-            )
-            ds = f[key]
-            handles[name]  = ds
-            shapes[name]   = tuple(ds.shape)
+            hdf5_files.append(f)
+            key = next((k for k in ("data", "field") if k in f and isinstance(f[k], _h5py.Dataset)),
+                       next(k for k in f if isinstance(f[k], _h5py.Dataset)))
+            ds = f[key]; handles[name] = ds; shapes[name] = tuple(ds.shape)
     except Exception:
         for _f in hdf5_files:
             try: _f.close()
@@ -1444,20 +1578,7 @@ def _hdf5_direct_chunked_run(
     total_rows    = primary_shape[0]
     n_fields      = len(field_paths)
 
-    chunk_rows = _compute_chunk_rows(primary_shape, device, n_fields)
-    n_chunks   = math.ceil(total_rows / chunk_rows)
-
-    _budget_explain(primary_shape, device, n_fields, chunk_rows, n_chunks)
-
-    if verbose and (not _IS_HPC or _HPC_RANK == 0):
-        chunk_gb = _tensor_gb((chunk_rows,) + primary_shape[1:]) * n_fields
-        print(f"  Direct-HDF5 stream: {total_rows} rows → "
-              f"{n_chunks} chunks × {chunk_rows} rows  "
-              f"({chunk_gb:.3f} GB/chunk × {n_fields} field(s))")
-        if device.type == "cuda":
-            print(f"  {_vram_bar(device)}")
-
-    probe_rows = min(8, total_rows)
+    probe_rows = min(4, total_rows) 
     probe_fmap: Dict[str, torch.Tensor] = dict(scalar_map)
     for name, ds in handles.items():
         arr = ds[:probe_rows]
@@ -1471,8 +1592,7 @@ def _hdf5_direct_chunked_run(
     base_graph, pre_sink, warns, field_node_ids, _sympy_expr = compile_expression(
         expr_str, dx=dx, boundary=boundary, field_map=probe_fmap
     )
-    t_compile_end = time.perf_counter()
-    t_compile     = t_compile_end - t_compile_start
+    t_compile = time.perf_counter() - t_compile_start
 
     with torch.no_grad():
         probe_rt      = stenpy.Runtime(stenpy.MemoryManager(), device=str(device))
@@ -1480,16 +1600,42 @@ def _hdf5_direct_chunked_run(
 
     probe_out    = probe_out_map.get(pre_sink)
     out_trailing = tuple(probe_out.shape[1:]) if isinstance(probe_out, torch.Tensor) else ()
+    in_elements_per_row  = math.prod(primary_shape[1:]) if len(primary_shape) > 1 else 1
+    out_elements_per_row = math.prod(out_trailing) if out_trailing else 1
+    output_multiplier    = max(1.0, out_elements_per_row / max(in_elements_per_row, 1))
 
-    _nerd(f"probe output trailing dims: {out_trailing}  field_node_ids: {field_node_ids}")
+    _nerd(f"probe output trailing dims: {out_trailing}  output_multiplier: {output_multiplier:.2f}x")
+
+    for nid in base_graph._order:
+        node = base_graph._nodes[nid]
+        if node.op_name == "_constant":
+            val = node.params.get("value")
+            if isinstance(val, torch.Tensor) and val.device.type == device.type:
+                stub = torch.zeros(val.shape, dtype=val.dtype, device="cpu")
+                object.__setattr__(node, "params", {"value": stub})
 
     del probe_fmap, probe_out_map, probe_out, probe_rt
     if device.type == "cuda":
         torch.cuda.empty_cache()
         _nerd(f"post-probe VRAM: {torch.cuda.memory_allocated(device)/1024**3:.3f} GB")
 
-    _chunk_mm = stenpy.MemoryManager()
-    _chunk_rt = stenpy.Runtime(_chunk_mm, device=str(device))
+    chunk_rows = _compute_chunk_rows(
+        primary_shape, device, n_fields, output_multiplier,
+        graph_overhead=3.0,
+    )
+    n_chunks_est = math.ceil(total_rows / chunk_rows)
+
+    _budget_explain(primary_shape, device, n_fields, chunk_rows, n_chunks_est)
+
+    if verbose and (not _IS_HPC or _HPC_RANK == 0):
+        chunk_gb_in  = _tensor_gb((chunk_rows,) + primary_shape[1:]) * n_fields
+        chunk_gb_out = _tensor_gb((chunk_rows,) + out_trailing) if out_trailing else 0.0
+        print(f"  Direct-HDF5 stream: {total_rows} rows  "
+              f"initial chunk={chunk_rows} rows  "
+              f"({chunk_gb_in:.3f} GB in / {chunk_gb_out:.3f} GB out  "
+              f"expansion {output_multiplier:.1f}x)")
+        if device.type == "cuda":
+            print(f"  {_vram_bar(device)}")
 
     out_full_shape = (total_rows,) + out_trailing
     out_f  = _h5py.File(out_path, "w")
@@ -1497,56 +1643,22 @@ def _hdf5_direct_chunked_run(
         "data",
         shape            = out_full_shape,
         dtype            = np.float64,
-        chunks           = ((min(chunk_rows, total_rows),) + out_trailing
-                            if out_trailing else None),
+        chunks           = ((min(chunk_rows, total_rows),) + out_trailing if out_trailing else None),
         compression      = "gzip",
         compression_opts = 1,
     )
     out_f.attrs["spacing"] = list(spacing) if spacing else [1.0]
     out_f.attrs["origin"]  = list(origin)  if origin  else [0.0]
 
-    t0        = time.perf_counter()
+    WRITE_Q_BOUND = 1
+    write_q: Queue = Queue(maxsize=WRITE_Q_BOUND)
+    _writer_stop = threading.Event()
+    write_errors: List[Exception] = []
+
     out_min   = float("inf")
     out_max   = float("-inf")
     out_sum   = 0.0
     out_count = 0
-    bytes_in  = 0
-
-    chunk_read_times:    List[float] = []
-    chunk_h2d_times:     List[float] = []
-    chunk_compute_times: List[float] = []
-    chunk_dh_times:      List[float] = []
-    chunk_write_times:   List[float] = []
-
-    pinned_bufs: Dict[str, Optional[torch.Tensor]] = {}
-    if device.type == "cuda":
-        for name in handles:
-            buf_shape = (chunk_rows,) + shapes[name][1:]
-            try:
-                pinned_bufs[name] = torch.empty(buf_shape, dtype=torch.float64).pin_memory()
-            except Exception:
-                pinned_bufs[name] = None   
-
-    read_q: Queue = Queue(maxsize=_PIPELINE_DEPTH)
-
-    def _reader() -> None:
-        try:
-            for ci in range(n_chunks):
-                row_start = ci * chunk_rows
-                row_end   = min(row_start + chunk_rows, total_rows)
-                t_r0 = time.perf_counter()
-                chunk_np: Dict[str, np.ndarray] = {}
-                for name, ds in handles.items():
-                    arr = ds[row_start:row_end]
-                    chunk_np[name] = arr.astype(np.float64, copy=False)
-                chunk_read_times.append(time.perf_counter() - t_r0)
-                read_q.put((ci, row_start, row_end, chunk_np))
-            read_q.put(None)
-        except Exception as exc:
-            read_q.put(exc)
-
-    write_q: Queue = Queue(maxsize=_PIPELINE_DEPTH)
-    _writer_stop = threading.Event()
 
     def _writer() -> None:
         nonlocal out_min, out_max, out_sum, out_count
@@ -1554,134 +1666,176 @@ def _hdf5_direct_chunked_run(
             try:
                 item = write_q.get(timeout=0.05)
             except _QueueEmpty:
-                if _writer_stop.is_set():
-                    break
+                if _writer_stop.is_set(): break
                 continue
             if item is None:
-                write_q.task_done()
-                break
+                write_q.task_done(); break
             row_start, row_end, out_cpu = item
-            t_w0 = time.perf_counter()
-            arr = out_cpu.numpy() if isinstance(out_cpu, torch.Tensor) else out_cpu
-            out_ds[row_start:row_end] = arr
-            chunk_write_times.append(time.perf_counter() - t_w0)
-            flat       = arr.ravel()
-            out_min    = min(out_min,   float(flat.min()))
-            out_max    = max(out_max,   float(flat.max()))
-            out_sum   += float(flat.sum())
-            out_count += flat.size
-            del arr, out_cpu
-            write_q.task_done()
+            try:
+                arr = out_cpu.numpy() if isinstance(out_cpu, torch.Tensor) else out_cpu
+                out_ds[row_start:row_end] = arr
+                flat = arr.ravel()
+                out_min    = min(out_min,   float(flat.min()))
+                out_max    = max(out_max,   float(flat.max()))
+                out_sum   += float(flat.sum())
+                out_count += flat.size
+            except Exception as exc:
+                write_errors.append(exc)
+            finally:
+                del out_cpu, arr
+                write_q.task_done()
 
-    reader_t = threading.Thread(target=_reader, daemon=True, name="hdf5-reader")
     writer_t = threading.Thread(target=_writer, daemon=True, name="hdf5-writer")
-    reader_t.start()
     writer_t.start()
 
-    try:
-        with _make_bar(n_chunks, desc="Streaming", unit="chunk", colour="green") as bar:
-            while True:
-                item = read_q.get()
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    raise item
+    t0        = time.perf_counter()
+    bytes_in  = 0
+    row_pos   = 0
+    n_chunks_actual = 0
 
-                ci, row_start, row_end, chunk_np = item
-                t_h2d_start = time.perf_counter()
-                chunk_tensors: Dict[str, torch.Tensor] = {}
-                for name, arr in chunk_np.items():
+    chunk_read_times:    List[float] = []
+    chunk_h2d_times:     List[float] = []
+    chunk_compute_times: List[float] = []
+    chunk_dh_times:      List[float] = []
+    chunk_write_times:   List[float] = []
+
+    pinned_staging: Dict[str, Optional[torch.Tensor]] = {}
+    if device.type == "cuda":
+        for name, ds in handles.items():
+            probe_shape = (chunk_rows,) + tuple(ds.shape[1:])
+            try:
+                buf = torch.empty(probe_shape, dtype=torch.float64, pin_memory=True)
+                pinned_staging[name] = buf
+            except Exception:
+                pinned_staging[name] = None  
+
+    try:
+
+        with _make_bar(n_chunks_est, desc="Streaming", unit="chunk", colour="green") as bar:
+            while row_pos < total_rows:
+                if write_errors:
+                    raise RuntimeError(f"HDF5 write error: {write_errors[0]}")
+
+                chunk_rows = _adapt_chunk_rows(
+                    chunk_rows, primary_shape, device, n_fields, output_multiplier
+                )
+
+                row_start = row_pos
+                row_end   = min(row_start + chunk_rows, total_rows)
+                n_rows_chunk = row_end - row_start
+
+                t_r0 = time.perf_counter()
+                chunk_np: Dict[str, np.ndarray] = {}
+                for name, ds in handles.items():
+                    arr = ds[row_start:row_end]
                     if not arr.flags["C_CONTIGUOUS"]:
                         arr = np.ascontiguousarray(arr)
-                    n_rows_chunk = arr.shape[0]
-                    if device.type == "cuda" and pinned_bufs.get(name) is not None:
-                        buf = pinned_bufs[name][:n_rows_chunk]   
-                        buf.copy_(torch.from_numpy(arr))          
-                        chunk_tensors[name] = buf.to(device, non_blocking=True)
-                    elif device.type == "cuda":
-                        t_cpu = torch.from_numpy(arr)
-                        chunk_tensors[name] = t_cpu.pin_memory().to(device, non_blocking=True)
-                    else:
-                        chunk_tensors[name] = torch.from_numpy(arr).to(device)
-                    bytes_in += arr.nbytes
-                del chunk_np
+                    chunk_np[name] = arr.astype(np.float64, copy=False)
+                    bytes_in += chunk_np[name].nbytes
+                chunk_read_times.append(time.perf_counter() - t_r0)
+
+                t_h2d = time.perf_counter()
+                chunk_tensors: Dict[str, torch.Tensor] = {}
+
                 if device.type == "cuda":
-                    torch.cuda.current_stream(device).synchronize()
-                chunk_h2d_times.append(time.perf_counter() - t_h2d_start)
+                    for name, arr in chunk_np.items():
+                        staging = pinned_staging.get(name)
+                        n_rows_arr = arr.shape[0]
+                        if staging is not None and n_rows_arr <= staging.shape[0]:
+                            pin_view = staging[:n_rows_arr]
+                            pin_view.copy_(torch.from_numpy(arr))
+                            chunk_tensors[name] = pin_view.to(device, non_blocking=True)
+                        else:
+                            cpu_t = torch.from_numpy(arr.copy())
+                            try:
+                                cpu_t_p = cpu_t.pin_memory()
+                            except Exception:
+                                cpu_t_p = cpu_t
+                            chunk_tensors[name] = cpu_t_p.to(device, non_blocking=True)
+                            del cpu_t, cpu_t_p
+                    if device.type == "cuda":
+                        torch.cuda.current_stream(device).synchronize()
+                else:
+                    for name, arr in chunk_np.items():
+                        chunk_tensors[name] = torch.from_numpy(arr).clone()
+
+                chunk_np.clear()
+                del chunk_np
+                gc.collect()  
+
+                chunk_h2d_times.append(time.perf_counter() - t_h2d)
 
                 chunk_graph = stenpy.Graph()
                 for node_id in base_graph._order:
                     node = base_graph._nodes[node_id]
-                    
-                    field_name = next((n for n, nid in field_node_ids.items() if nid == node_id), None)
-                    
+                    field_name = next(
+                        (n for n, nid in field_node_ids.items() if nid == node_id), None
+                    )
                     if field_name and field_name in chunk_tensors:
-                        chunk_graph.add("_constant", (), {"value": chunk_tensors[field_name]}, node_id=node_id)
+                        chunk_graph.add("_constant", (),
+                                        {"value": chunk_tensors[field_name]},
+                                        node_id=node_id)
                     else:
-                        chunk_graph.add(node.op_name, node.input_ids, dict(node.params), node_id=node_id)
+                        chunk_graph.add(node.op_name, node.input_ids,
+                                        dict(node.params), node_id=node_id)
 
-                t_compute_start = time.perf_counter()
+                t_compute = time.perf_counter()
                 with torch.no_grad():
-                    chunk_results = _chunk_rt.run(chunk_graph)
+                    chunk_results = stenpy.Runtime(
+                        stenpy.MemoryManager(), device=str(device), skip_pool=True
+                    ).run(chunk_graph)
                 if device.type == "cuda":
                     torch.cuda.current_stream(device).synchronize()
-                chunk_compute_times.append(time.perf_counter() - t_compute_start)
+                chunk_compute_times.append(time.perf_counter() - t_compute)
 
                 out_gpu = chunk_results.get(pre_sink)
 
-                t_dh_start = time.perf_counter()
-                out_cpu = (out_gpu.detach().cpu()
-                        if isinstance(out_gpu, torch.Tensor)
-                        else torch.zeros((row_end - row_start,) + out_trailing,
-                                            dtype=torch.float64))
+                t_dh = time.perf_counter()
+                if isinstance(out_gpu, torch.Tensor):
+                    out_cpu = out_gpu.detach().cpu()
+                else:
+                    out_cpu = torch.zeros(
+                        (n_rows_chunk,) + out_trailing, dtype=torch.float64
+                    )
                 if device.type == "cuda":
                     torch.cuda.current_stream(device).synchronize()
-                chunk_dh_times.append(time.perf_counter() - t_dh_start)
+                chunk_dh_times.append(time.perf_counter() - t_dh)
 
-                vram_before_free = (torch.cuda.memory_allocated(device)
-                                    if device.type == "cuda" else 0)
-                n_live = len(_chunk_mm._live) if hasattr(_chunk_mm, "_live") else -1
-
-                del chunk_tensors, chunk_graph
+                del chunk_tensors
+                del chunk_graph
                 del chunk_results
                 del out_gpu
-
-                _safe_mm_clear(_chunk_mm)
-
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                    vram_after = torch.cuda.memory_allocated(device)
-                    freed_gb   = (vram_before_free - vram_after) / 1024**3
-                    props_d    = torch.cuda.get_device_properties(device)
-                    vram_pct   = vram_after / max(props_d.total_memory, 1) * 100
+                else:
+                    gc.collect()
 
-                    if _NERD:
-                        sev = _sev_label(vram_pct)
-                        _rank0_print(
-                            f"\n  │  chunk {ci+1:>3}/{n_chunks}"
-                            f"  freed {freed_gb:.3f} GB"
-                            f"  live_refs {n_live}→0"
-                            f"  VRAM {vram_after/1024**3:.2f} GB"
-                            f"  {vram_pct:.0f}%{sev}"
-                        )
-
-                    if vram_pct >= _T_CRIT:
-                        bar.set_postfix_str(
-                            f"  ██ CRIT {vram_pct:.0f}% VRAM — risk of OOM", refresh=True)
-
+                t_w0 = time.perf_counter()
                 write_q.put((row_start, row_end, out_cpu))
+                chunk_write_times.append(time.perf_counter() - t_w0)
+                del out_cpu
+
+                row_pos      = row_end
+                n_chunks_actual += 1
 
                 elapsed = time.perf_counter() - t0
                 tput    = (bytes_in / 1024**3) / elapsed if elapsed > 0 else 0.0
                 bar.update(1)
-                if device.type == "cuda" and not _NERD:
-                    vram_gb = torch.cuda.memory_allocated(device) / 1024**3
-                    bar.set_postfix_str(f"{tput:.2f} GB/s  VRAM {vram_gb:.1f}GB", refresh=False)
+
+                status_parts = [f"{tput:.2f} GB/s"]
+                if device.type == "cuda":
+                    used_gb = torch.cuda.memory_allocated(device) / 1024**3
+                    total_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                    pct = used_gb / max(total_gb, 1e-9) * 100
+                    status_parts.append(f"VRAM {used_gb:.2f}/{total_gb:.0f}GB ({pct:.0f}%)")
+                    status_parts.append(f"chunk={chunk_rows}r")
+                    if pct >= _T_CRIT:
+                        status_parts.append("██CRIT")
                 else:
-                    bar.set_postfix_str(f"{tput:.2f} GB/s", refresh=False)
+                    status_parts.append(f"chunk={chunk_rows}r")
+                bar.set_postfix_str("  ".join(status_parts), refresh=False)
 
         write_q.put(None)
-        reader_t.join()
         writer_t.join()
         write_q.join()
 
@@ -1693,18 +1847,19 @@ def _hdf5_direct_chunked_run(
                 write_q.task_done()
             except _QueueEmpty:
                 break
-        reader_t.join(timeout=10.0)
         writer_t.join(timeout=10.0)
         raise
 
     finally:
-        try:
-            out_f.close()
-        except Exception:
-            pass
+        pinned_staging.clear()
+        try: out_f.close()
+        except Exception: pass
         for f in hdf5_files:
             try: f.close()
             except Exception: pass
+
+    if write_errors:
+        raise RuntimeError(f"HDF5 write error: {write_errors[0]}")
 
     elapsed  = time.perf_counter() - t0
     out_gb   = _tensor_gb(out_full_shape)
@@ -1717,29 +1872,30 @@ def _hdf5_direct_chunked_run(
         vram_total_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
 
     return {
-        "shape_out":       list(out_full_shape),
-        "min":             out_min if out_min != float("inf")  else 0.0,
-        "max":             out_max if out_max != float("-inf") else 0.0,
-        "mean":            out_mean,
-        "elapsed_s":       elapsed,
-        "throughput_gbs":  out_gb / elapsed if elapsed > 0 else 0.0,
-        "t_compile":       t_compile,
-        "t_read":          sum(chunk_read_times),
-        "t_h2d":           sum(chunk_h2d_times),
-        "t_compute":       sum(chunk_compute_times),
-        "t_d2h":           sum(chunk_dh_times),
-        "t_write":         sum(chunk_write_times),
-        "chunk_read_s":    chunk_read_times,
-        "chunk_h2d_s":     chunk_h2d_times,
-        "chunk_compute_s": chunk_compute_times,
-        "chunk_dh_s":      chunk_dh_times,
-        "chunk_write_s":   chunk_write_times,
-        "n_chunks":        n_chunks,
-        "chunk_rows":      chunk_rows,
-        "peak_vram_gb":    peak_vram_gb,
-        "vram_total_gb":   vram_total_gb,
-        "input_gb":        bytes_in / 1024**3,
-        "output_gb":       out_gb,
+        "shape_out":         list(out_full_shape),
+        "min":               out_min if out_min != float("inf")  else 0.0,
+        "max":               out_max if out_max != float("-inf") else 0.0,
+        "mean":              out_mean,
+        "elapsed_s":         elapsed,
+        "throughput_gbs":    out_gb / elapsed if elapsed > 0 else 0.0,
+        "output_multiplier": output_multiplier,
+        "t_compile":         t_compile,
+        "t_read":            sum(chunk_read_times),
+        "t_h2d":             sum(chunk_h2d_times),
+        "t_compute":         sum(chunk_compute_times),
+        "t_d2h":             sum(chunk_dh_times),
+        "t_write":           sum(chunk_write_times),
+        "chunk_read_s":      chunk_read_times,
+        "chunk_h2d_s":       chunk_h2d_times,
+        "chunk_compute_s":   chunk_compute_times,
+        "chunk_dh_s":        chunk_dh_times,
+        "chunk_write_s":     chunk_write_times,
+        "n_chunks":          n_chunks_actual,
+        "chunk_rows":        chunk_rows,   
+        "peak_vram_gb":      peak_vram_gb,
+        "vram_total_gb":     vram_total_gb,
+        "input_gb":          bytes_in / 1024**3,
+        "output_gb":         out_gb,
     }
 
 
@@ -1761,14 +1917,13 @@ class RunResult:
     throughput_gbs:  float          = 0.0
     perf:            Optional[PerfStats] = None
 
-def _print_banner(title: str, width: int = 72) -> None:
+def _print_banner(title, width=72):
     _rank0_print(f"\n{'═'*width}\n  {title}\n{'═'*width}")
 
-def _print_section(title: str, width: int = 72) -> None:
+def _print_section(title, width=72):
     _rank0_print(f"\n{'─'*width}\n  {title}\n{'─'*width}")
 
-def _load_field(path: str, device: torch.device,
-                normalize: bool) -> Tuple[Any, Tuple, Tuple]:
+def _load_field(path, device, normalize):
     with _h5py.File(path, "r") as f:
         key    = next((k for k in ("data", "field") if k in f), list(f.keys())[0])
         nbytes = f[key].size * 8
@@ -1780,19 +1935,10 @@ def _load_field(path: str, device: torch.device,
     return loaded, (1.0,) * loaded.ndim, (0.0,) * loaded.ndim
 
 class Pipeline:
-    def __init__(
-        self,
-        field_paths: Dict[str, str],
-        project:     Optional[str] = None,
-        device:      str           = "cpu",
-        dx:          float         = 1.0,
-        boundary:    str           = "neumann",
-        normalize:   bool          = False,
-        verbose:     bool          = True,
-    ) -> None:
+    def __init__(self, field_paths, project=None, device="cpu", dx=1.0,
+                 boundary="neumann", normalize=False, verbose=True):
         if not field_paths:
             raise ValueError("At least one field path must be supplied.")
-
         self.field_paths = field_paths
         self.device      = torch.device(device)
         self.dx          = dx
@@ -1802,7 +1948,6 @@ class Pipeline:
 
         ts        = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         proj_name = project or f"run_{ts}"
-
         if _IS_HPC:
             self.out_dir = Path(_hpc_scratch()) / "ops_outputs" / proj_name
         else:
@@ -1818,8 +1963,7 @@ class Pipeline:
         self.src_stem  = "field"
 
         for name, path in field_paths.items():
-            if self.verbose:
-                print(f"  Loading field '{name}' from : {path}")
+            if self.verbose: print(f"  Loading field '{name}' from : {path}")
             _hdf5_dissect(path)
             tensor, spacing, origin = _load_field(path, self.device, normalize)
             shape = tuple(tensor.shape) if hasattr(tensor, "shape") else ()
@@ -1828,23 +1972,18 @@ class Pipeline:
             self.origins[name]  = origin
             self.shapes[name]   = shape
             if self.spacing is None:
-                self.spacing  = spacing
-                self.origin   = origin
+                self.spacing = spacing; self.origin = origin
                 self.src_stem = Path(path).stem
 
         self.tensor = next(iter(self.fields.values()))
 
         if len(field_paths) > 1:
             merged_dx, merged_origin, merged_end = _merge_domain(
-                self.spacings, self.origins, self.shapes
-            )
+                self.spacings, self.origins, self.shapes)
             if self.verbose:
                 print(f"\n  ── Multi-field domain merge ──────────────────────")
-                print(f"  dx      : {merged_dx:.6g}  (largest across all fields)")
-                print(f"  origin  : {merged_origin}")
-                print(f"  end     : {merged_end}")
-            if self.dx == 1.0:
-                self.dx = merged_dx
+                print(f"  dx      : {merged_dx:.6g}  origin  : {merged_origin}  end: {merged_end}")
+            if self.dx == 1.0: self.dx = merged_dx
             self.spacing = tuple(merged_dx for _ in merged_origin)
             self.origin  = merged_origin
         elif self.dx == 1.0 and self.spacing is not None:
@@ -1860,119 +1999,84 @@ class Pipeline:
             print(f"  Device              : {self.device}")
             if self.device.type == "cuda":
                 print(f"  {_vram_bar(self.device)}")
-                p  = torch.cuda.get_device_properties(self.device)
                 bw = _gpu_peak_bw_gbs(self.device)
-                if math.isnan(bw):
-                    print(f"  GPU peak mem BW     : N/A (ROCm attributes missing)")
-                else:
-                    mem_clock = getattr(p, 'memory_clock_rate', None) or getattr(p, 'clock_rate', None)
-                    mem_bus   = getattr(p, 'memory_bus_width', None)
-                    if mem_clock is not None and mem_bus is not None:
-                        print(f"  GPU peak mem BW     : {bw:.0f} GB/s  "
-                              f"({mem_clock/1e6:.2f} GHz × {mem_bus}-bit DDR)")
-                    else:
-                        print(f"  GPU peak mem BW     : {bw:.0f} GB/s  (details missing)")
+                if not math.isnan(bw): print(f"  GPU peak mem BW     : {bw:.0f} GB/s")
             print(f"  Output folder       : {self.out_dir}/")
-            if _IS_HPC:
-                print(f"  HPC mode            : rank {_HPC_RANK}/{_HPC_WORLD}")
-            if _NERD:
-                print(f"  Nerd mode           : ON  (OPS_NERD=1)")
+            if _IS_HPC: print(f"  HPC mode            : rank {_HPC_RANK}/{_HPC_WORLD}")
+            if _NERD:   print(f"  Nerd mode           : ON  (OPS_NERD=1)")
+            free_vram = _free_vram_bytes(self.device) / 1024**3 if self.device.type == "cuda" else 0
+            free_ram  = _free_ram_bytes() / 1024**3
+            print(f"  Free VRAM           : {free_vram:.2f} GB" if self.device.type == "cuda" else
+                  f"  Free RAM            : {free_ram:.2f} GB")
+            print(f"  Chunk VRAM budget   : {_CHUNK_VRAM_FRACTION:.0%}  "
+                  f"RAM budget: {_CHUNK_RAM_FRACTION:.0%}  "
+                  f"(env: OPS_CHUNK_VRAM_FRAC / OPS_CHUNK_RAM_FRAC)")
 
         self.mm = stenpy.MemoryManager()
         self.rt = stenpy.Runtime(self.mm, device=device)
         self._run_index = 0
 
-    def load_field(self, name: str, path: str) -> None:
-        if self.verbose:
-            print(f"  Loading field '{name}' from : {path}")
+    def load_field(self, name, path):
+        if self.verbose: print(f"  Loading field '{name}' from : {path}")
         _hdf5_dissect(path)
         tensor, spacing, origin = _load_field(path, self.device, self.normalize)
         shape = tuple(tensor.shape) if hasattr(tensor, "shape") else ()
-        self.fields[name]      = tensor
-        self.spacings[name]    = spacing
-        self.origins[name]     = origin
-        self.shapes[name]      = shape
+        self.fields[name] = tensor; self.spacings[name] = spacing
+        self.origins[name] = origin; self.shapes[name] = shape
         self.field_paths[name] = path
-
         merged_dx, merged_origin, merged_end = _merge_domain(
-            self.spacings, self.origins, self.shapes
-        )
-        self.dx      = merged_dx
+            self.spacings, self.origins, self.shapes)
+        self.dx = merged_dx
         self.spacing = tuple(merged_dx for _ in merged_origin)
         self.origin  = merged_origin
-
         if self.verbose:
             print(f"  '{name}' loaded — shape {shape}")
-            print(f"  Domain re-merged  dx={merged_dx:.6g}  "
-                  f"origin={merged_origin}  end={merged_end}")
+            print(f"  Domain re-merged  dx={merged_dx:.6g}  origin={merged_origin}  end={merged_end}")
 
-    def _resolve_boundary_and_vars(self, expr_str: str) -> Tuple[str, Dict[str, Any]]:
-        boundary    = self.boundary
-        spatial_ops = {
-            "gradient", "gradient_nd", "divergence", "laplacian",
-            "curl", "hessian", "mean_curvature", "surface_normals",
-            "material_derivative", "spectral_gradient", "spectral_laplacian",
-        }
-        if (not _IS_HPC and
-                any(op in expr_str for op in spatial_ops) and
-                boundary == "neumann"):
-            print(f"\n  ℹ  Expression uses a spatial operator.")
-            print(f"  Current boundary condition: {boundary}")
-            try:
-                ans = input("  Keep it or change? [Enter = keep, c = change] ❯ ").strip()
-            except (EOFError, KeyboardInterrupt):
-                ans = ""
+    def _resolve_boundary_and_vars(self, expr_str):
+        boundary = self.boundary
+        spatial_ops = {"gradient", "gradient_nd", "divergence", "laplacian", "curl",
+                       "hessian", "mean_curvature", "surface_normals",
+                       "material_derivative", "spectral_gradient", "spectral_laplacian"}
+        if (not _IS_HPC and any(op in expr_str for op in spatial_ops)
+                and boundary == "neumann"):
+            print(f"\n  ℹ  Expression uses a spatial operator.  Current BC: {boundary}")
+            try: ans = input("  Keep it or change? [Enter = keep, c = change] ❯ ").strip()
+            except (EOFError, KeyboardInterrupt): ans = ""
             if ans.lower() in ("c", "change"):
-                boundary = _select_boundary()
-                self.boundary = boundary
+                boundary = _select_boundary(); self.boundary = boundary
 
         field_map = dict(self.fields)
         for name, uv in _USER_VARS.items():
-            if not re.search(rf'\b{re.escape(name)}\b', expr_str):
-                continue
+            if not re.search(rf'\b{re.escape(name)}\b', expr_str): continue
             if uv.steps <= 1:
                 uv.current = uv.start
                 field_map[name] = torch.tensor(uv.current, dtype=torch.float64)
-                if self.verbose:
-                    print(f"  ℹ  '{name}' = {uv.current:.6g}")
             else:
                 if _IS_HPC:
-                    uv.current = uv.start
-                    field_map.pop(name, None)
+                    uv.current = uv.start; field_map.pop(name, None)
                     field_map[f"__sweep_{name}"] = uv
                 else:
                     print(f"\n  Variable '{name}'  range [{uv.start}, {uv.end}]  {uv.steps} steps")
-                    print("    [1]  Use start value only")
-                    print("    [2]  Enter a specific value")
-                    print("    [3]  Sweep all values (runs once per step)")
-                    try:
-                        ch = input("  Choice [2] ❯ ").strip() or "2"
-                    except (EOFError, KeyboardInterrupt):
-                        ch = "1"
+                    print("    [1]  Use start value only\n    [2]  Enter a specific value\n    [3]  Sweep all values")
+                    try: ch = input("  Choice [2] ❯ ").strip() or "2"
+                    except (EOFError, KeyboardInterrupt): ch = "1"
                     if ch == "1":
                         uv.current = uv.start
                         field_map[name] = torch.tensor(uv.current, dtype=torch.float64)
                     elif ch == "3":
-                        uv.current = uv.start
-                        field_map.pop(name, None)
+                        uv.current = uv.start; field_map.pop(name, None)
                         field_map[f"__sweep_{name}"] = uv
                     else:
                         try:
-                            uv.current = float(
-                                input(f"  Value for {name} [{uv.current}] ❯ ").strip()
-                                or str(uv.current)
-                            )
-                        except ValueError:
-                            uv.current = uv.start
+                            uv.current = float(input(f"  Value for {name} [{uv.current}] ❯ ").strip() or str(uv.current))
+                        except ValueError: uv.current = uv.start
                         field_map[name] = torch.tensor(uv.current, dtype=torch.float64)
-                        print(f"  ℹ  '{name}' = {uv.current:.6g}")
-
         return boundary, field_map
 
     def run_expr(self, expr_str: str) -> RunResult:
         self._run_index += 1
-        if self.verbose:
-            _print_section(f"Expression #{self._run_index}:  {expr_str}")
+        if self.verbose: _print_section(f"Expression #{self._run_index}:  {expr_str}")
 
         boundary, field_map = self._resolve_boundary_and_vars(expr_str)
 
@@ -1985,139 +2089,116 @@ class Pipeline:
         primary    = self.tensor
         is_lazy    = isinstance(primary, stenpy.LazyField)
 
-        # ------------------------------------------------------------------
-        # LazyField (streaming) path
-        # ------------------------------------------------------------------
         if is_lazy:
-            lazy_field_names = {
-                n for n, v in field_map.items() if isinstance(v, stenpy.LazyField)
-            }
-            lazy_path_map = {
-                n: self.field_paths[n] for n in lazy_field_names
-                if n in self.field_paths
-            }
+            lazy_field_names = {n for n, v in field_map.items() if isinstance(v, stenpy.LazyField)}
+            lazy_path_map    = {n: self.field_paths[n] for n in lazy_field_names if n in self.field_paths}
             scalar_map_for_chunk = {
                 n: v for n, v in field_map.items()
-                if n not in lazy_path_map
-                and not n.startswith("__")
-                and isinstance(v, torch.Tensor)
+                if n not in lazy_path_map and not n.startswith("__") and isinstance(v, torch.Tensor)
             }
 
-            sympy_expr_for_flops: Optional[sp.Expr] = None
+            sympy_expr_for_flops = None
             warns: List[str] = []
             try:
                 probe_fm = dict(scalar_map_for_chunk)
                 for n, p in lazy_path_map.items():
-                    ds, _ = _open_hdf5_field(p)
+                    ds, _ = stenpy._open_hdf5_field(p) 
+                    if ds is None:
+                        f_tmp = _h5py.File(p, "r")
+                        key_tmp = next((k for k in ("data","field") if k in f_tmp), next(iter(f_tmp)))
+                        ds = f_tmp[key_tmp]
                     try:
                         probe_fm[n] = torch.from_numpy(ds[:2].astype(np.float64))
                     finally:
-                        ds.file.close()
+                        try: 
+                            if hasattr(ds, 'file') and ds.file:
+                                ds.file.close()
+                        except Exception: 
+                            pass
                 _, _, warns, _, sympy_expr_for_flops = compile_expression(
-                    expr_str, dx=self.dx, boundary=boundary, field_map=probe_fm
-                )
+                    expr_str, dx=self.dx, boundary=boundary, field_map=probe_fm)
                 if self.verbose and warns:
-                    for w in warns:
-                        print(f"  ℹ  {w}")
+                    for w in warns: print(f"  ℹ  {w}")
             except Exception:
                 warns = []
 
             in_shape = tuple(primary.shape)
             if self.verbose:
                 print(f"\n  LazyField  {in_shape}  {_tensor_gb(in_shape):.3f} GB")
-                print(f"  → Direct-HDF5 VRAM-safe chunked stream")
-                if self.device.type == "cuda":
-                    print(f"  {_vram_bar(self.device)}")
+                print(f"  → Direct-HDF5 adaptive-chunked stream")
+                if self.device.type == "cuda": print(f"  {_vram_bar(self.device)}")
 
             t_total_start = time.perf_counter()
             stats = _hdf5_direct_chunked_run(
-                expr_str    = expr_str,
-                field_paths = lazy_path_map,
-                scalar_map  = scalar_map_for_chunk,
-                dx          = self.dx,
-                boundary    = boundary,
-                out_path    = out_path,
-                spacing     = self.spacing,
-                origin      = self.origin,
-                device      = self.device,
-                verbose     = self.verbose,
+                expr_str=expr_str, field_paths=lazy_path_map,
+                scalar_map=scalar_map_for_chunk, dx=self.dx, boundary=boundary,
+                out_path=out_path, spacing=self.spacing, origin=self.origin,
+                device=self.device, verbose=self.verbose,
             )
             t_total = time.perf_counter() - t_total_start
 
             shape_out  = tuple(stats["shape_out"])
             elapsed_ms = stats["elapsed_s"] * 1e3
             tput       = stats["throughput_gbs"]
-
-            n_elem    = math.prod(int(s) for s in shape_out) if shape_out else 1
-            est_flops = (_ast_flops(sympy_expr_for_flops, n_elem)
-                         if sympy_expr_for_flops is not None else 0.0)
+            n_elem     = math.prod(int(s) for s in shape_out) if shape_out else 1
+            est_flops  = (_ast_flops(sympy_expr_for_flops, n_elem)
+                        if sympy_expr_for_flops is not None else 0.0)
 
             if self.verbose:
-                elapsed_s = elapsed_ms / 1e3
-                print(f"\n  ✓ {elapsed_ms:.0f} ms ({elapsed_s:.1f} s)  │  {tput:.3f} GB/s")
+                print(f"\n  ✓ {elapsed_ms:.0f} ms ({elapsed_ms/1e3:.1f} s)  │  {tput:.3f} GB/s")
                 print(f"  Output shape  : {shape_out}  ({_tensor_gb(shape_out):.3f} GB)")
                 print(f"  min / max     : {stats['min']:.6g}  /  {stats['max']:.6g}")
                 print(f"  mean          : {stats['mean']:.6g}")
-                if self.device.type == "cuda":
-                    print(f"  {_vram_bar(self.device)}")
+                if self.device.type == "cuda": print(f"  {_vram_bar(self.device)}")
                 print(f"  Saved → {out_path}")
 
             perf = PerfStats(
-                expr_str        = expr_str,
-                mode            = "lazy",
-                input_gb        = stats.get("input_gb", _tensor_gb(in_shape)),
-                output_gb       = stats.get("output_gb", _tensor_gb(shape_out)),
-                t_compile       = stats.get("t_compile", 0.0),
-                t_read          = stats.get("t_read",    0.0),
-                t_h2d           = stats.get("t_h2d",     0.0),
-                t_compute       = stats.get("t_compute", stats["elapsed_s"]),
-                t_d2h           = stats.get("t_d2h",     0.0),
-                t_write         = stats.get("t_write",   0.0),
-                t_total         = t_total,
-                chunk_read_s    = stats.get("chunk_read_s",    []),
-                chunk_h2d_s     = stats.get("chunk_h2d_s",     []),
-                chunk_compute_s = stats.get("chunk_compute_s", []),
-                chunk_dh_s      = stats.get("chunk_dh_s",      []),
-                chunk_write_s   = stats.get("chunk_write_s",   []),
-                n_chunks        = stats.get("n_chunks",   0),
-                chunk_rows      = stats.get("chunk_rows", 0),
-                peak_vram_gb    = stats.get("peak_vram_gb",  0.0),
-                vram_total_gb   = stats.get("vram_total_gb", 0.0),
-                est_flops       = est_flops,
+                expr_str=expr_str, mode="lazy",
+                input_gb=stats.get("input_gb", _tensor_gb(in_shape)),
+                output_gb=stats.get("output_gb", _tensor_gb(shape_out)),
+                t_compile=stats.get("t_compile", 0.0), t_read=stats.get("t_read", 0.0),
+                t_h2d=stats.get("t_h2d", 0.0),
+                t_compute=stats.get("t_compute", stats["elapsed_s"]),
+                t_d2h=stats.get("t_d2h", 0.0), t_write=stats.get("t_write", 0.0),
+                t_total=t_total,
+                chunk_read_s=stats.get("chunk_read_s", []),
+                chunk_h2d_s=stats.get("chunk_h2d_s", []),
+                chunk_compute_s=stats.get("chunk_compute_s", []),
+                chunk_dh_s=stats.get("chunk_dh_s", []),
+                chunk_write_s=stats.get("chunk_write_s", []),
+                n_chunks=stats.get("n_chunks", 0), chunk_rows=stats.get("chunk_rows", 0),
+                peak_vram_gb=stats.get("peak_vram_gb", 0.0),
+                vram_total_gb=stats.get("vram_total_gb", 0.0),
+                est_flops=est_flops,
             )
-
             _flush_vram(self.device, verbose=False)
             return RunResult(
                 op_name=expr_str, expr_str=expr_str, output=None,
                 elapsed_ms=elapsed_ms, shape_in=in_shape, shape_out=shape_out,
                 simplifications=warns, node_count=0,
-                out_path=out_path, throughput_gbs=tput,
-                perf=perf,
+                out_path=out_path, throughput_gbs=tput, perf=perf,
             )
 
         t_compile_start = time.perf_counter()
         try:
             graph, sink_id, warns, field_node_ids, sympy_expr = compile_expression(
                 expr_str, dx=self.dx, boundary=boundary,
-                field_map={k: v for k, v in field_map.items()
-                           if not k.startswith("__")},
-            )
+                field_map={k: v for k, v in field_map.items() if not k.startswith("__")})
         except ValueError as exc:
-            print(f"  ✗ Parse/compile error: {exc}"); raise
+            print(f"  ✗ Parse/compile error: {exc}")
+            raise
         t_compile = time.perf_counter() - t_compile_start
 
         if self.verbose and warns:
-            for w in warns:
-                print(f"  ℹ  {w}")
-
+            for w in warns: print(f"  ℹ  {w}")
         if self.verbose:
             topo = graph.topological_sort()
             print(f"  Graph  ({len(topo)} nodes):")
             for n in topo:
-                meta     = stenpy.OP_METADATA.get(n.op_name, {})
-                cost     = meta.get("cost", "")
+                meta = stenpy.OP_METADATA.get(n.op_name, {})
+                cost = meta.get("cost", "")
                 cost_str = f"  [{cost}]" if cost else ""
-                deps     = f"← {n.input_ids}" if n.input_ids else "(source)"
+                deps = f"← {n.input_ids}" if n.input_ids else "(source)"
                 print(f"    {n.op_name:<22}  {deps}{cost_str}")
 
         if self.device.type == "cuda":
@@ -2129,27 +2210,27 @@ class Pipeline:
                 with _make_bar(1, desc="Computing", unit="step") as bar:
                     with torch.no_grad():
                         results = self.rt.run(graph)
-                    if self.device.type == "cuda":
-                        torch.cuda.synchronize()
-                    bar.update(1)
+                        if self.device.type == "cuda": 
+                            torch.cuda.synchronize()
+                        bar.update(1)
             else:
                 with torch.no_grad():
                     results = self.rt.run(graph)
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize()
+                    if self.device.type == "cuda": 
+                        torch.cuda.synchronize()
 
             t_compute  = time.perf_counter() - t_compute_start
             elapsed_ms = (t_compile + t_compute) * 1e3
-
-            output    = results.get(sink_id)
-            shape_out = tuple(output.shape) if isinstance(output, torch.Tensor) else None
-            out_gb    = _tensor_gb(shape_out) if shape_out else 0.0
-            tput      = out_gb / t_compute if t_compute > 1e-9 else 0.0
+            output     = results.get(sink_id)
+            shape_out  = tuple(output.shape) if isinstance(output, torch.Tensor) else None
+            out_gb     = _tensor_gb(shape_out) if shape_out else 0.0
+            tput       = out_gb / t_compute if t_compute > 1e-9 else 0.0
 
             t_dh_start = time.perf_counter()
+            out_cpu_save = None
             if isinstance(output, torch.Tensor) and output.ndim >= 1:
                 out_cpu_save = output.detach().cpu()
-                if self.device.type == "cuda":
+                if self.device.type == "cuda": 
                     torch.cuda.synchronize()
             t_d2h = time.perf_counter() - t_dh_start
 
@@ -2157,8 +2238,7 @@ class Pipeline:
             vram_total_gb = 0.0
             if self.device.type == "cuda" and torch.cuda.is_available():
                 peak_vram_gb  = torch.cuda.max_memory_allocated(self.device) / 1024**3
-                vram_total_gb = (torch.cuda.get_device_properties(self.device)
-                                 .total_memory / 1024**3)
+                vram_total_gb = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
 
             if self.verbose:
                 print(f"  ✓ {elapsed_ms:.0f} ms  │  {tput:.3f} GB/s")
@@ -2166,31 +2246,30 @@ class Pipeline:
                     print(f"  Output shape  : {shape_out}  ({out_gb:.3f} GB)")
                 if isinstance(output, torch.Tensor):
                     flat = output.flatten()
-                    print(f"  min / max     : {flat.min().item():.6g}  /  "
-                          f"{flat.max().item():.6g}")
+                    print(f"  min / max     : {flat.min().item():.6g}  /  {flat.max().item():.6g}")
                     print(f"  mean          : {flat.mean().item():.6g}")
-                    if torch.isnan(output).any():
+                    if torch.isnan(output).any(): 
                         print("  ██ CRIT  NaN detected in output!")
-                    if torch.isinf(output).any():
+                    if torch.isinf(output).any(): 
                         print("  ▲▲ WARN  Inf detected in output!")
-                if self.device.type == "cuda":
+                if self.device.type == "cuda": 
                     print(f"  {_vram_bar(self.device)}")
 
             in_shape = tuple(self.tensor.shape) if hasattr(self.tensor, "shape") else ()
             in_gb    = _tensor_gb(in_shape)
 
             t_write_start = time.perf_counter()
-            if isinstance(output, torch.Tensor) and output.ndim >= 1:
+            if out_cpu_save is not None:
                 stenpy.save_tensor(out_cpu_save, self.spacing, self.origin, out_path)
-                if self.verbose:
+                if self.verbose: 
                     print(f"  Saved → {out_path}")
             else:
-                out_path   = out_path.replace(".h5", ".json")
+                out_path = out_path.replace(".h5", ".json")
                 scalar_val = output.item() if isinstance(output, torch.Tensor) else float(output)
                 with open(out_path, "w") as jf:
                     json.dump({"expression": expr_str, "result": scalar_val,
-                               "elapsed_ms": elapsed_ms}, jf, indent=2)
-                if self.verbose:
+                            "elapsed_ms": elapsed_ms}, jf, indent=2)
+                if self.verbose: 
                     print(f"  Scalar: {scalar_val:.6g}  → {out_path}")
             t_write = time.perf_counter() - t_write_start
 
@@ -2198,162 +2277,101 @@ class Pipeline:
             est_flops = _ast_flops(sympy_expr, n_elem)
 
             perf = PerfStats(
-                expr_str      = expr_str,
-                mode          = "eager",
-                input_gb      = in_gb,
-                output_gb     = out_gb,
-                t_compile     = t_compile,
-                t_read        = 0.0,
-                t_h2d         = 0.0,
-                t_compute     = t_compute,
-                t_d2h         = t_d2h,
-                t_write       = t_write,
-                t_total       = t_compile + t_compute + t_d2h + t_write,
-                peak_vram_gb  = peak_vram_gb,
-                vram_total_gb = vram_total_gb,
-                est_flops     = est_flops,
+                expr_str=expr_str, mode="eager",
+                input_gb=in_gb, output_gb=out_gb,
+                t_compile=t_compile, t_read=0.0, t_h2d=0.0,
+                t_compute=t_compute, t_d2h=t_d2h, t_write=t_write,
+                t_total=t_compile + t_compute + t_d2h + t_write,
+                peak_vram_gb=peak_vram_gb, vram_total_gb=vram_total_gb,
+                est_flops=est_flops,
             )
-
             return RunResult(
                 op_name=expr_str, expr_str=expr_str, output=output,
                 elapsed_ms=elapsed_ms, shape_in=in_shape, shape_out=shape_out,
                 simplifications=warns, node_count=len(graph),
-                out_path=out_path, throughput_gbs=tput,
-                perf=perf,
+                out_path=out_path, throughput_gbs=tput, perf=perf,
             )
         finally:
             self.rt.flush_vram()
 
-    def _run_sweep(
-        self,
-        expr_str:   str,
-        field_map:  Dict[str, Any],
-        sweep_keys: List[str],
-        boundary:   str,
-    ) -> RunResult:
+    def _run_sweep(self, expr_str, field_map, sweep_keys, boundary):
         svars: List[UserVar] = [field_map.pop(k) for k in sweep_keys]
         clean_map = {k: v for k, v in field_map.items() if not k.startswith("__")}
         results_list: List[RunResult] = []
-        uv   = svars[0]
-        vals = uv.values
-
+        uv = svars[0]; vals = uv.values
         has_lazy = any(isinstance(v, stenpy.LazyField) for v in clean_map.values())
-
-        sweep_sympy_expr: Optional[sp.Expr] = None
+        sweep_sympy_expr = None
         try:
-            sweep_sympy_expr = parse_expression(
-                expr_str,
-                field_names=set(clean_map.keys()) | {uv.name},
-            )
-        except Exception:
-            pass
+            sweep_sympy_expr = parse_expression(expr_str, field_names=set(clean_map.keys()) | {uv.name})
+        except Exception: pass
+        compiled_graph = compiled_sink = None; compiled_warns = []; compiled_fnids = {}
+        if self.verbose: print(f"\n  Sweeping '{uv.name}' over {len(vals)} values …")
 
-        compiled_graph: Optional[stenpy.Graph] = None
-        compiled_sink:  Optional[str]          = None
-        compiled_warns: List[str]              = []
-        compiled_fnids: Dict[str, str]         = {}
-
-        if self.verbose:
-            print(f"\n  Sweeping '{uv.name}' over {len(vals)} values …")
-
-        with _make_bar(len(vals), desc=f"Sweep {uv.name}", unit="step",
-                    colour="green") as bar:
+        with _make_bar(len(vals), desc=f"Sweep {uv.name}", unit="step", colour="green") as bar:
             for v in vals:
                 uv.current = float(v)
-                sweep_map  = {**clean_map,
-                            uv.name: torch.tensor(uv.current, dtype=torch.float64)}
-
-                fname   = _expr_to_filename(f"{expr_str}_{uv.name}{v:.4g}",
-                                            self.src_stem)
+                sweep_map  = {**clean_map, uv.name: torch.tensor(uv.current, dtype=torch.float64)}
+                fname   = _expr_to_filename(f"{expr_str}_{uv.name}{v:.4g}", self.src_stem)
                 op_path = str(self.out_dir / f"{fname}.h5")
-
                 try:
                     if has_lazy:
-                        lazy_path_map = {
-                            n: self.field_paths[n]
-                            for n, val in clean_map.items()
-                            if isinstance(val, stenpy.LazyField) and n in self.field_paths
-                        }
-                        scalar_map_for_chunk = {
-                            n: val for n, val in sweep_map.items()
-                            if n not in lazy_path_map
-                            and not n.startswith("__")
-                            and isinstance(val, torch.Tensor)
-                        }
+                        lazy_path_map = {n: self.field_paths[n] for n, val in clean_map.items()
+                                         if isinstance(val, stenpy.LazyField) and n in self.field_paths}
+                        scalar_map_for_chunk = {n: val for n, val in sweep_map.items()
+                                                if n not in lazy_path_map and not n.startswith("__")
+                                                and isinstance(val, torch.Tensor)}
                         stats = _hdf5_direct_chunked_run(
-                            expr_str    = expr_str,
-                            field_paths = lazy_path_map,
-                            scalar_map  = scalar_map_for_chunk,
-                            dx          = self.dx,
-                            boundary    = boundary,
-                            out_path    = op_path,
-                            spacing     = self.spacing,
-                            origin      = self.origin,
-                            device      = self.device,
-                            verbose     = self.verbose,
+                            expr_str=expr_str, field_paths=lazy_path_map,
+                            scalar_map=scalar_map_for_chunk, dx=self.dx, boundary=boundary,
+                            out_path=op_path, spacing=self.spacing, origin=self.origin,
+                            device=self.device, verbose=self.verbose,
                         )
                         shape_out = tuple(stats["shape_out"])
                         in_shape  = tuple(next(iter(self.shapes.values())))
                         n_elem    = math.prod(int(s) for s in shape_out) if shape_out else 1
                         est_flops = (_ast_flops(sweep_sympy_expr, n_elem)
-                                    if sweep_sympy_expr is not None else 0.0)
+                                     if sweep_sympy_expr is not None else 0.0)
                         perf = PerfStats(
-                            expr_str        = expr_str,
-                            mode            = "lazy",
-                            input_gb        = stats.get("input_gb", 0.0),
-                            output_gb       = stats.get("output_gb", _tensor_gb(shape_out)),
-                            t_compile       = stats.get("t_compile", 0.0),
-                            t_read          = stats.get("t_read",    0.0),
-                            t_h2d           = stats.get("t_h2d",     0.0),
-                            t_compute       = stats.get("t_compute", stats["elapsed_s"]),
-                            t_d2h           = stats.get("t_d2h",     0.0),
-                            t_write         = stats.get("t_write",   0.0),
-                            t_total         = stats["elapsed_s"],
-                            chunk_read_s    = stats.get("chunk_read_s",    []),
-                            chunk_h2d_s     = stats.get("chunk_h2d_s",     []),
-                            chunk_compute_s = stats.get("chunk_compute_s", []),
-                            chunk_dh_s      = stats.get("chunk_dh_s",      []),
-                            chunk_write_s   = stats.get("chunk_write_s",   []),
-                            n_chunks        = stats.get("n_chunks",    0),
-                            chunk_rows      = stats.get("chunk_rows",  0),
-                            peak_vram_gb    = stats.get("peak_vram_gb",  0.0),
-                            vram_total_gb   = stats.get("vram_total_gb", 0.0),
-                            est_flops       = est_flops,
+                            expr_str=expr_str, mode="lazy",
+                            input_gb=stats.get("input_gb", 0.0),
+                            output_gb=stats.get("output_gb", _tensor_gb(shape_out)),
+                            t_compile=stats.get("t_compile", 0.0), t_read=stats.get("t_read", 0.0),
+                            t_h2d=stats.get("t_h2d", 0.0),
+                            t_compute=stats.get("t_compute", stats["elapsed_s"]),
+                            t_d2h=stats.get("t_d2h", 0.0), t_write=stats.get("t_write", 0.0),
+                            t_total=stats["elapsed_s"],
+                            chunk_read_s=stats.get("chunk_read_s", []),
+                            chunk_h2d_s=stats.get("chunk_h2d_s", []),
+                            chunk_compute_s=stats.get("chunk_compute_s", []),
+                            chunk_dh_s=stats.get("chunk_dh_s", []),
+                            chunk_write_s=stats.get("chunk_write_s", []),
+                            n_chunks=stats.get("n_chunks", 0), chunk_rows=stats.get("chunk_rows", 0),
+                            peak_vram_gb=stats.get("peak_vram_gb", 0.0),
+                            vram_total_gb=stats.get("vram_total_gb", 0.0),
+                            est_flops=est_flops,
                         )
                         results_list.append(RunResult(
                             op_name=expr_str, expr_str=expr_str, output=None,
                             elapsed_ms=stats["elapsed_s"] * 1e3,
                             shape_in=in_shape, shape_out=shape_out,
                             simplifications=[], node_count=0,
-                            out_path=op_path,
-                            throughput_gbs=stats["throughput_gbs"],
-                            perf=perf,
+                            out_path=op_path, throughput_gbs=stats["throughput_gbs"], perf=perf,
                         ))
                         if self.verbose:
                             print(f"  {uv.name}={v:.4g}  →  {op_path}"
-                                f"  ({stats['elapsed_s']:.1f}s  "
-                                f"{stats['throughput_gbs']:.3f} GB/s)")
-                        if self.device.type == "cuda":
-                            torch.cuda.empty_cache()
-
+                                  f"  ({stats['elapsed_s']:.1f}s  {stats['throughput_gbs']:.3f} GB/s)")
+                        if self.device.type == "cuda": torch.cuda.empty_cache()
                     else:
                         if compiled_graph is None:
                             compiled_graph, compiled_sink, compiled_warns, compiled_fnids, _ = compile_expression(
-                                expr_str, dx=self.dx, boundary=boundary,
-                                field_map=sweep_map,
-                            )
+                                expr_str, dx=self.dx, boundary=boundary, field_map=sweep_map)
                         else:
                             scalar_node_id = compiled_fnids.get(uv.name)
                             if scalar_node_id is not None:
                                 compiled_graph = compiled_graph.clone_with_replacement(
-                                    scalar_node_id,
-                                    torch.tensor(uv.current, dtype=torch.float64),
-                                )
-
-                        with torch.no_grad():
-                            res = self.rt.run(compiled_graph)
-                        if self.device.type == "cuda":
-                            torch.cuda.synchronize()
+                                    scalar_node_id, torch.tensor(uv.current, dtype=torch.float64))
+                        with torch.no_grad(): res = self.rt.run(compiled_graph)
+                        if self.device.type == "cuda": torch.cuda.synchronize()
                         out = res.get(compiled_sink)
                         if isinstance(out, torch.Tensor) and out.ndim >= 1:
                             stenpy.save_tensor(out, self.spacing, self.origin, op_path)
@@ -2364,57 +2382,44 @@ class Pipeline:
                             simplifications=compiled_warns, node_count=len(compiled_graph),
                             out_path=op_path,
                         ))
-
                 except Exception as exc:
                     _rank0_print(f"\n  ✗ {uv.name}={v:.4g}  {exc}")
                     compiled_graph = None
                 finally:
-                    if not has_lazy:
-                        self.rt.flush_vram()
-
+                    if not has_lazy: self.rt.flush_vram()
                 bar.update(1)
 
         uv.current = uv.start
-
         if results_list:
-            if self.verbose:
-                print(f"  Sweep complete — {len(results_list)} outputs in {self.out_dir}/")
+            if self.verbose: print(f"  Sweep complete — {len(results_list)} outputs in {self.out_dir}/")
             return results_list[-1]
         else:
-            _rank0_print(f"  ✗ Sweep produced no outputs — all steps failed.")
-            return RunResult(
-                op_name=expr_str, expr_str=expr_str, output=None,
-                elapsed_ms=0, shape_in=(), shape_out=None,
-                simplifications=[], node_count=0,
-            )
+            _rank0_print(f"  ✗ Sweep produced no outputs.")
+            return RunResult(op_name=expr_str, expr_str=expr_str, output=None,
+                             elapsed_ms=0, shape_in=(), shape_out=None,
+                             simplifications=[], node_count=0)
 
-    def run_batch(self, expressions: List[str]) -> List[RunResult]:
+    def run_batch(self, expressions):
         _print_banner(f"ops.py  Multi-Operator Pipeline  —  {len(expressions)} expr(s)")
         _rank0_print(f"  Fields : {list(self.fields.keys())}  "
                      f"dx={self.dx:.4g}  bc={self.boundary}  device={self.device}")
         if _IS_HPC:
-            _rank0_print(f"  HPC    : rank {_HPC_RANK}/{_HPC_WORLD}  "
-                         f"scratch={_hpc_scratch()}")
+            _rank0_print(f"  HPC    : rank {_HPC_RANK}/{_HPC_WORLD}  scratch={_hpc_scratch()}")
         if self.device.type == "cuda":
             _rank0_print(f"  {_vram_bar(self.device)}")
-
-        if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
         results_list: List[RunResult] = []
         total_t0 = time.perf_counter()
 
         for expr_str in expressions:
-            try:
-                results_list.append(self.run_expr(expr_str))
-            except Exception as exc:
-                _rank0_print(f"\n  ✗ FAILED: {expr_str}  →  {exc}")
-            if self.device.type == "cuda" and _gpu_free_gb(self.device) < 1.0:
+            try: results_list.append(self.run_expr(expr_str))
+            except Exception as exc: _rank0_print(f"\n  ✗ FAILED: {expr_str}  →  {exc}")
+            if self.device.type == "cuda" and _gpu_free_gb(self.device) < 0.5:
                 _rank0_print(f"  ▲▲ WARN  Low VRAM — flushing automatically.")
                 _flush_vram(self.device, verbose=self.verbose)
 
-        total_s  = time.perf_counter() - total_t0
-        total_ms = total_s * 1e3
+        total_s = time.perf_counter() - total_t0
 
         _print_section("Summary")
         col_w = 36
@@ -2425,7 +2430,7 @@ class Pipeline:
             expr  = _truncate(r.expr_str, col_w)
             _rank0_print(f"  {i:<3}  {expr:<{col_w}}  "
                          f"{r.elapsed_ms:>9.0f}  {r.throughput_gbs:>6.3f}  {shape}")
-        _rank0_print(f"\n  Total  : {total_ms:.0f} ms  ({total_s:.1f} s)")
+        _rank0_print(f"\n  Total  : {total_s*1e3:.0f} ms  ({total_s:.1f} s)")
         _rank0_print(f"  Output : {self.out_dir}/")
 
         perf_list = [r.perf for r in results_list if r.perf is not None]
@@ -2433,40 +2438,35 @@ class Pipeline:
             _print_perf_report(perf_list, self.device, total_s, verbose=True)
 
         manifest = {
-            "fields":    self.field_paths,
-            "dx":        self.dx,
-            "boundary":  self.boundary,
-            "device":    str(self.device),
-            "total_ms":  total_ms,
-            "hpc_rank":  _HPC_RANK  if _IS_HPC else None,
+            "fields": self.field_paths, "dx": self.dx, "boundary": self.boundary,
+            "device": str(self.device), "total_ms": total_s * 1e3,
+            "hpc_rank": _HPC_RANK if _IS_HPC else None,
             "hpc_world": _HPC_WORLD if _IS_HPC else None,
+            "memory_config": {
+                "chunk_vram_fraction": _CHUNK_VRAM_FRACTION,
+                "chunk_ram_fraction": _CHUNK_RAM_FRACTION,
+                "vram_shrink_trigger": _VRAM_SHRINK_TRIGGER,
+                "ram_shrink_trigger": _RAM_SHRINK_TRIGGER,
+            },
             "runs": [
                 {
-                    "index":          i,
-                    "expr":           r.expr_str,
-                    "elapsed_ms":     r.elapsed_ms,
+                    "index": i, "expr": r.expr_str, "elapsed_ms": r.elapsed_ms,
                     "throughput_gbs": r.throughput_gbs,
-                    "shape_in":       list(r.shape_in),
-                    "shape_out":      list(r.shape_out) if r.shape_out else None,
-                    "nodes":          r.node_count,
-                    "simplifications":r.simplifications,
-                    "output_file":    r.out_path,
+                    "shape_in": list(r.shape_in),
+                    "shape_out": list(r.shape_out) if r.shape_out else None,
+                    "nodes": r.node_count, "simplifications": r.simplifications,
+                    "output_file": r.out_path,
                     "perf": {
-                        "mode":          r.perf.mode,
-                        "input_gb":      r.perf.input_gb,
-                        "output_gb":     r.perf.output_gb,
-                        "t_compile_s":   r.perf.t_compile,
-                        "t_read_s":      r.perf.t_read,
-                        "t_h2d_s":       r.perf.t_h2d,
-                        "t_compute_s":   r.perf.t_compute,
-                        "t_d2h_s":       r.perf.t_d2h,
-                        "t_write_s":     r.perf.t_write,
-                        "t_total_s":     r.perf.t_total,
-                        "est_flops":     r.perf.est_flops,
+                        "mode": r.perf.mode, "input_gb": r.perf.input_gb,
+                        "output_gb": r.perf.output_gb, "t_compile_s": r.perf.t_compile,
+                        "t_read_s": r.perf.t_read, "t_h2d_s": r.perf.t_h2d,
+                        "t_compute_s": r.perf.t_compute, "t_d2h_s": r.perf.t_d2h,
+                        "t_write_s": r.perf.t_write, "t_total_s": r.perf.t_total,
+                        "est_flops": r.perf.est_flops,
                         "est_flops_note": "AST-derived upper bound; CSE may reduce actual ops",
-                        "tflops":        r.perf.tflops(),
-                        "peak_vram_gb":  r.perf.peak_vram_gb,
-                        "n_chunks":      r.perf.n_chunks,
+                        "tflops": r.perf.tflops(),
+                        "peak_vram_gb": r.perf.peak_vram_gb,
+                        "n_chunks": r.perf.n_chunks,
                     } if r.perf else None,
                 }
                 for i, r in enumerate(results_list, 1)
