@@ -1106,34 +1106,33 @@ def _pad1d(t: torch.Tensor, dim: int, r: int, bc: str) -> torch.Tensor:
         
         return padded
 
-def gradient(t: torch.Tensor, dim: int = 0, dx: float = 1.0, boundary: str = "neumann", alloc=None) -> torch.Tensor:
+def gradient(
+    t: torch.Tensor,
+    dim: int = 0,
+    dx: float = 1.0,
+    boundary: str = "neumann",
+    vector_field: bool = False,
+    alloc=None,
+) -> torch.Tensor:
     _assert_fp64(t, "gradient")
-    
-    is_vector_field = t.ndim >= 2 and t.shape[-1] in (2, 3)
-    
-    if is_vector_field:
+
+    if vector_field:
+        if t.ndim < 2:
+            raise ValueError("gradient: vector_field=True requires at least 2-D input")
         components = []
-        n_components = t.shape[-1]
-        
-        for i in range(n_components):
+        for i in range(t.shape[-1]):
             comp = t[..., i]
-            
-            ext = _pad1d(comp, dim, 1, boundary)
-            left = ext.narrow(dim, 0, comp.shape[dim])
+            ext  = _pad1d(comp, dim, 1, boundary)
+            left  = ext.narrow(dim, 0, comp.shape[dim])
             right = ext.narrow(dim, 2, comp.shape[dim])
-            comp_grad = (right - left) * (0.5 / dx)
-            components.append(comp_grad)
-        
-        out = torch.stack(components, dim=-1)
-        
-        if out.ndim == t.ndim:
-            out = out.unsqueeze(-1)
+            components.append((right - left) * (0.5 / dx))
+        out = torch.stack(components, dim=-1).unsqueeze(-1)
     else:
-        ext = _pad1d(t, dim, 1, boundary)
-        left = ext.narrow(dim, 0, t.shape[dim])
+        ext   = _pad1d(t, dim, 1, boundary)
+        left  = ext.narrow(dim, 0, t.shape[dim])
         right = ext.narrow(dim, 2, t.shape[dim])
-        out = (right - left) * (0.5 / dx)
-    
+        out   = (right - left) * (0.5 / dx)
+
     if alloc:
         buf = alloc(out.shape, out.device, key=_uid("grad"))
         buf.copy_(out)
@@ -1182,9 +1181,9 @@ def laplacian_3d_kernel(
     off_y = pid_y * BLOCK_Y + tl.arange(0, BLOCK_Y)
     off_z = pid_z * BLOCK_Z + tl.arange(0, BLOCK_Z)
     mask = (off_x < nx) & (off_y < ny) & (off_z < nz)
-
+    
     def idx(x, y, z):
-        return z * (nx * ny) + y * nx + x
+        return x * (ny * nz) + y * nz + z
 
     if periodic:
         xm = (off_x - 1) % nx
@@ -1201,19 +1200,18 @@ def laplacian_3d_kernel(
         zm = tl.maximum(off_z - 1, 0)
         zp = tl.minimum(off_z + 1, nz - 1)
 
-    c = tl.load(x_ptr + idx(off_x, off_y, off_z), mask=mask, other=0.0)
-    fxm = tl.load(x_ptr + idx(xm, off_y, off_z), mask=mask, other=0.0)
-    fxp = tl.load(x_ptr + idx(xp, off_y, off_z), mask=mask, other=0.0)
-    fym = tl.load(x_ptr + idx(off_x, ym, off_z), mask=mask, other=0.0)
-    fyp = tl.load(x_ptr + idx(off_x, yp, off_z), mask=mask, other=0.0)
-    fzm = tl.load(x_ptr + idx(off_x, off_y, zm), mask=mask, other=0.0)
-    fzp = tl.load(x_ptr + idx(off_x, off_y, zp), mask=mask, other=0.0)
+    c   = tl.load(x_ptr + idx(off_x, off_y, off_z), mask=mask, other=0.0)
+    fxm = tl.load(x_ptr + idx(xm,    off_y, off_z), mask=mask, other=0.0)
+    fxp = tl.load(x_ptr + idx(xp,    off_y, off_z), mask=mask, other=0.0)
+    fym = tl.load(x_ptr + idx(off_x, ym,    off_z), mask=mask, other=0.0)
+    fyp = tl.load(x_ptr + idx(off_x, yp,    off_z), mask=mask, other=0.0)
+    fzm = tl.load(x_ptr + idx(off_x, off_y, zm   ), mask=mask, other=0.0)
+    fzp = tl.load(x_ptr + idx(off_x, off_y, zp   ), mask=mask, other=0.0)
 
     lap = ((fxp + fxm - 2.0 * c) / dx2 +
            (fyp + fym - 2.0 * c) / dy2 +
            (fzp + fzm - 2.0 * c) / dz2)
     tl.store(out_ptr + idx(off_x, off_y, off_z), lap, mask=mask)
-
 
 class Laplacian:
     def __init__(self, boundary: str = "periodic") -> None:
@@ -1250,10 +1248,9 @@ class Laplacian:
                     float(dv[0] * dv[0]),
                     float(dv[1] * dv[1]),
                     float(dv[2] * dv[2]),
-                    True,  
+                    True,
                     BLOCK_X=BLOCK_X, BLOCK_Y=BLOCK_Y, BLOCK_Z=BLOCK_Z,
                 )
-                torch.cuda.synchronize()   
                 return out
             except Exception:
                 pass
@@ -1749,32 +1746,32 @@ _SPACING_HINTS = [
 
 
 class LazyField:
-
     def __init__(self, path: str, dataset_name: str = "field") -> None:
-        self.path = path
+        self.path         = path
         self.dataset_name = dataset_name
-        self._lock = threading.RLock()
-        self._local = threading.local()  # Each thread gets own file handle
+        self._lock        = threading.RLock()
+        self._local       = threading.local()
+        self._all_files: List[h5py.File] = []   # one per thread that opened
 
     def _ensure_open(self) -> None:
-        if not hasattr(self._local, 'file') or self._local.file is None:
-            self._local.file = h5py.File(self.path, "r")
-            self._local.dset = None
-            
-            # Find dataset
-            for cand in (self.dataset_name, "data", "field"):
-                if cand in self._local.file and isinstance(self._local.file[cand], h5py.Dataset):
-                    self._local.dset = self._local.file[cand]
+        if getattr(self._local, "file", None) is not None:
+            return
+        f = h5py.File(self.path, "r")
+        self._local.file = f
+        self._local.dset = None
+        with self._lock:
+            self._all_files.append(f)
+        for cand in (self.dataset_name, "data", "field"):
+            if cand in f and isinstance(f[cand], h5py.Dataset):
+                self._local.dset = f[cand]
+                break
+        if self._local.dset is None:
+            for k in f:
+                if isinstance(f[k], h5py.Dataset):
+                    self._local.dset = f[k]
                     break
-            
-            if self._local.dset is None:
-                for k in self._local.file:
-                    if isinstance(self._local.file[k], h5py.Dataset):
-                        self._local.dset = self._local.file[k]
-                        break
-            
-            if self._local.dset is None:
-                raise KeyError(f"No array dataset found in {self.path}")
+        if self._local.dset is None:
+            raise KeyError(f"No array dataset found in {self.path}")
 
     @property
     def shape(self) -> Tuple:
@@ -1792,14 +1789,17 @@ class LazyField:
             return self._local.dset[idx]
 
     def close(self) -> None:
-        if hasattr(self._local, 'file') and self._local.file is not None:
-            try:
-                self._local.file.close()
-            except Exception:
-                pass
-            finally:
-                self._local.file = None
-                self._local.dset = None
+        with self._lock:
+            for f in self._all_files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            self._all_files.clear()
+        # best-effort clear of the calling thread's slot
+        if getattr(self._local, "file", None) is not None:
+            self._local.file = None
+            self._local.dset = None
 
     def __del__(self) -> None:
         self.close()
@@ -1812,19 +1812,21 @@ class LazyField:
         return f"LazyField(path={self.path}, shape={sh}, fp64)"
 
 
-
-def _open_hdf5_field(path: str) -> Tuple[h5py.Dataset, Tuple[int, ...]]:
+@contextlib.contextmanager
+def _open_hdf5_field(path: str) -> Iterator[Tuple[h5py.Dataset, Tuple[int, ...]]]:
     f = h5py.File(path, "r")
-    for cand in ("data", "field"):
-        if cand in f and isinstance(f[cand], h5py.Dataset):
-            ds = f[cand]
-            return ds, tuple(ds.shape)
-    for k in f:
-        if isinstance(f[k], h5py.Dataset):
-            ds = f[k]
-            return ds, tuple(ds.shape)
-    raise KeyError(f"No array dataset found in {path}")
-
+    try:
+        for cand in ("data", "field"):
+            if cand in f and isinstance(f[cand], h5py.Dataset):
+                yield f[cand], tuple(f[cand].shape)
+                return
+        for k in f:
+            if isinstance(f[k], h5py.Dataset):
+                yield f[k], tuple(f[k].shape)
+                return
+        raise KeyError(f"No array dataset found in {path}")
+    finally:
+        f.close()
 
 def load_tensor(
     path: str,
