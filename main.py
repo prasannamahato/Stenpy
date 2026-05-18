@@ -1,3 +1,5 @@
+#mains.py
+
 from __future__ import annotations
 import argparse
 import datetime
@@ -1253,9 +1255,6 @@ def _merge_domain(
 # GPU-saturating direct-HDF5 chunked executor
 # ----------------------------------------------------------------------
 
-_CHUNK_VRAM_FRACTION = 0.6
-_PIPELINE_DEPTH      = 0
-
 def _free_ram_bytes() -> int:
     try:
         import psutil
@@ -1283,30 +1282,6 @@ def _free_vram_bytes(device: torch.device) -> int:
     reclaimable = (reserved - allocated) // 2
     free = props.total_memory - reserved + reclaimable
     return max(0, free)
-
-
-def _open_hdf5_field(path: str) -> Tuple[_h5py.Dataset, Tuple[int, ...]]:
-    f   = _h5py.File(path, "r")
-    key = next(
-        (k for k in ("data", "field") if k in f and isinstance(f[k], _h5py.Dataset)),
-        next(k for k in f if isinstance(f[k], _h5py.Dataset)),
-    )
-    ds = f[key]
-    return ds, tuple(ds.shape)
-
-def _graph_multi_replace(
-    graph:        stenpy.Graph,
-    replacements: Dict[str, torch.Tensor],
-) -> stenpy.Graph:
-    g = stenpy.Graph()
-    for nid in graph._order:
-        node = graph._nodes[nid]
-        if nid in replacements:
-            g.add("_constant", (), {"value": replacements[nid]}, node_id=nid)
-        else:
-            g.add(node.op_name, node.input_ids, node.params, node_id=nid)
-    return g
-
 
 _STREAM_GLOBAL_OPS: Set[str] = {
     "norm_l2", "min_max", "covariance", "correlation", "surface_integral",
@@ -2102,23 +2077,13 @@ class Pipeline:
             try:
                 probe_fm = dict(scalar_map_for_chunk)
                 for n, p in lazy_path_map.items():
-                    ds, _ = stenpy._open_hdf5_field(p) 
-                    if ds is None:
-                        f_tmp = _h5py.File(p, "r")
-                        key_tmp = next((k for k in ("data","field") if k in f_tmp), next(iter(f_tmp)))
-                        ds = f_tmp[key_tmp]
-                    try:
+                    with stenpy._open_hdf5_field(p) as (ds, _shape):
                         probe_fm[n] = torch.from_numpy(ds[:2].astype(np.float64))
-                    finally:
-                        try: 
-                            if hasattr(ds, 'file') and ds.file:
-                                ds.file.close()
-                        except Exception: 
-                            pass
                 _, _, warns, _, sympy_expr_for_flops = compile_expression(
                     expr_str, dx=self.dx, boundary=boundary, field_map=probe_fm)
                 if self.verbose and warns:
-                    for w in warns: print(f"  ℹ  {w}")
+                    for w in warns:
+                        print(f"  ℹ  {w}")
             except Exception:
                 warns = []
 
