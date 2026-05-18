@@ -433,11 +433,12 @@ def _op_accepts_alloc(fn: Callable) -> bool:
 
 
 class Runtime:
-    def __init__(self, mm: MemoryManager, device: Union[str, torch.device] = "cpu") -> None:
+    def __init__(self, mm: MemoryManager, device: Union[str, torch.device] = "cpu", skip_pool=False) -> None:
         self.mm = mm
         _set_dist_mm(mm)
         self.device = torch.device(device)
         self._alloc_cache: Dict[str, bool] = {}
+        self.skip_pool = skip_pool
         self._h2d_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(self.device)
             if self.device.type == "cuda" and torch.cuda.is_available()
@@ -457,13 +458,40 @@ class Runtime:
         return counts
 
     def flush_vram(self) -> None:
-        with self.mm._lock:
-            dead_keys = [k for k, t in self.mm._live.items() if isinstance(t, torch.Tensor) and t.device.type == "cuda"]
-            for k in dead_keys:
-                t = self.mm._live.pop(k)
-                del t
-            self.mm._pool_ptrs.clear()
-        self.mm.clear_pool()
+        live = getattr(self.mm, "_live", None)
+        lock = getattr(self.mm, "_lock", None) or getattr(self.mm, "_live_lock", None)
+
+        if live is not None:
+            ctx = lock if lock is not None else contextlib.nullcontext()
+            with ctx:
+                dead_keys = []
+                for k, state in list(live.items()):
+                    tensor = state if isinstance(state, torch.Tensor) else getattr(state, "tensor", None)
+                    if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
+                        dead_keys.append(k)
+                for k in dead_keys:
+                    state = live.get(k)
+                    if isinstance(state, torch.Tensor):
+                        live.pop(k, None)
+                    elif state is not None:
+                        state.tensor = None
+                        state.is_free = True
+                        state.is_evicted = True
+
+                pool_ptrs = getattr(self.mm, "_pool_ptrs", None)
+                if pool_ptrs is not None:
+                    pool_ptrs.clear()
+
+                pending = getattr(self.mm, "_pending_writes", None)
+                if pending is not None:
+                    pending.clear()
+                    cond = getattr(self.mm, "_pending_writes_cond", None)
+                    if cond is not None:
+                        cond.notify_all()
+
+        clear_pool = getattr(self.mm, "clear_pool", None)
+        if callable(clear_pool):
+            clear_pool()
         _PINNED_POOL.clear()
         if self.device.type == "cuda" and torch.cuda.is_available():
             _clear_k_grid_cache()
@@ -738,7 +766,7 @@ class Runtime:
                 is_managed = self.mm.owns(output)
                 if is_managed and output._base is not None:
                     is_managed = False
-                if not is_managed and self.mm.should_manage(tuple(output.shape)) and output.is_contiguous():
+                if not self.skip_pool and not is_managed and self.mm.should_manage(output.shape) and output.is_contiguous():
                     if output.device.type == "cuda":
                         needed = output.numel() * 8
                         if _vram_headroom_ok(output.device, needed):
@@ -896,7 +924,12 @@ register_operator("mul", mul, cost="low")
 def div(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-15, alloc=None) -> torch.Tensor:
     _assert_fp64(a, "div(a)")
     _assert_fp64(b, "div(b)")
-    b_safe = b.clamp(min=eps)
+    eps_t = torch.as_tensor(eps, dtype=b.dtype, device=b.device)
+    b_safe = torch.where(
+        b.abs() < eps_t,
+        torch.where(b < 0, -eps_t, eps_t),
+        b,
+    )
     if alloc is None:
         return torch.div(a, b_safe)
     out = alloc(torch.broadcast_shapes(a.shape, b.shape), a.device, key=_uid("div"))
@@ -984,17 +1017,6 @@ register_operator("tanh", tanh, cost="medium")
 
 
 def _pad1d(t: torch.Tensor, dim: int, r: int, bc: str) -> torch.Tensor:
-    """Pad a tensor along a specific dimension.
-    
-    Args:
-        t: Input tensor
-        dim: Dimension to pad along (0-indexed)
-        r: Padding radius (pad r elements on each side)
-        bc: Boundary condition ('neumann', 'dirichlet', 'periodic', 'reflect')
-    
-    Returns:
-        Padded tensor
-    """
     mode_map = {
         "neumann": "replicate",
         "dirichlet": "constant", 
@@ -1085,11 +1107,6 @@ def _pad1d(t: torch.Tensor, dim: int, r: int, bc: str) -> torch.Tensor:
         return padded
 
 def gradient(t: torch.Tensor, dim: int = 0, dx: float = 1.0, boundary: str = "neumann", alloc=None) -> torch.Tensor:
-    """Compute gradient along a single dimension.
-    
-    For scalar fields: returns tensor of same shape
-    For vector fields (last dim = 2 or 3): returns tensor with extra dimension
-    """
     _assert_fp64(t, "gradient")
     
     is_vector_field = t.ndim >= 2 and t.shape[-1] in (2, 3)
@@ -1740,7 +1757,6 @@ class LazyField:
         self._local = threading.local()  # Each thread gets own file handle
 
     def _ensure_open(self) -> None:
-        """Open file handle in thread-local storage (h5py requires this)"""
         if not hasattr(self._local, 'file') or self._local.file is None:
             self._local.file = h5py.File(self.path, "r")
             self._local.dset = None
@@ -1771,13 +1787,11 @@ class LazyField:
         return np.float64
 
     def __getitem__(self, idx: Any) -> np.ndarray:
-        """Thread-safe read from HDF5"""
         with self._lock:
             self._ensure_open()
             return self._local.dset[idx]
 
     def close(self) -> None:
-        """Close file handle in current thread"""
         if hasattr(self._local, 'file') and self._local.file is not None:
             try:
                 self._local.file.close()
@@ -1826,14 +1840,33 @@ def load_tensor(
     dev = torch.device(device)
 
     with h5py.File(path, "r") as f:
-        spacing = tuple(float(v) for v in f["spacing"][:]) if "spacing" in f else (1.0,)
-        origin = tuple(float(v) for v in f["origin"][:]) if "origin" in f else tuple(0.0 for _ in spacing)
         for cand in ("field", "data"):
             if cand in f and isinstance(f[cand], h5py.Dataset):
                 dset = f[cand]
                 break
         else:
             raise KeyError(f"No field dataset found in {path}")
+        if "spacing" in f:
+            spacing = tuple(float(v) for v in f["spacing"][:])
+        elif "spacing" in f.attrs:
+            raw_spacing = f.attrs["spacing"]
+            spacing = tuple(float(v) for v in np.atleast_1d(raw_spacing))
+        elif "spacing" in dset.attrs:
+            raw_spacing = dset.attrs["spacing"]
+            spacing = tuple(float(v) for v in np.atleast_1d(raw_spacing))
+        else:
+            spacing = (1.0,) * max(1, dset.ndim)
+
+        if "origin" in f:
+            origin = tuple(float(v) for v in f["origin"][:])
+        elif "origin" in f.attrs:
+            raw_origin = f.attrs["origin"]
+            origin = tuple(float(v) for v in np.atleast_1d(raw_origin))
+        elif "origin" in dset.attrs:
+            raw_origin = dset.attrs["origin"]
+            origin = tuple(float(v) for v in np.atleast_1d(raw_origin))
+        else:
+            origin = tuple(0.0 for _ in spacing)
         shape = dset.shape
         total_bytes = np.prod(shape) * 8
         total_gb = total_bytes / 1024**3
