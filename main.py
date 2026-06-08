@@ -58,7 +58,6 @@ def _dbg(msg: str) -> None:
         print(f"[DEBUG] {msg}")
 
 def _log_memory_state(label: str, device: torch.device) -> None:
-    """Log current memory state to both console and file."""
     try:
         ram_info = psutil.virtual_memory()
         ram_pct = ram_info.percent
@@ -117,7 +116,6 @@ _PIPE_DEPTH        = int(os.environ.get("OPS_PIPE_DEPTH", "1"))
 _ROW_STREAM_THRESHOLD = int(os.environ.get("OPS_ROW_STREAM_THRESHOLD", str(16 * 1024 * 1024)))  
 
 def _is_rocm() -> bool:
-    """Detect if PyTorch is built against ROCm/HIP (AMD GPUs)."""
     try:
         import torch.version
         if getattr(torch.version, "hip", None) is not None:
@@ -375,7 +373,6 @@ _HEAVY_OP_OVERHEAD: Dict[str, float] = {
 }
 
 def _expr_peak_overhead(expr_str: str) -> float:
-    """Return estimated peak internal memory multiplier for the given expression."""
     peak = 1.0
     for op, factor in _HEAVY_OP_OVERHEAD.items():
         if re.search(rf'\b{re.escape(op)}\b', expr_str):
@@ -1210,7 +1207,6 @@ def _hdf5_chunk_size(ds: "_h5py.Dataset") -> int:
     return 1
 
 def _hdf5_output_chunks(shape: Tuple[int, ...], preferred_rows: int, dtype: Any = np.float64) -> Optional[Tuple[int, ...]]:
-    """Choose row chunks small enough for expanding outputs and HDF5's chunk limit."""
     if not shape:
         return None
     shape = tuple(int(s) for s in shape)
@@ -1890,7 +1886,6 @@ def _hdf5_direct_chunked_run(
     _log_memory_state("PRE-RUN", device)
 
     def _stage_log(stage: str) -> None:
-        """Helper to consistently log stage markers and memory state."""
         try:
             _logger.info(f"--- STAGE: {stage} ---")
             _log_memory_state(stage, device)
