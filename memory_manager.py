@@ -1472,9 +1472,6 @@ class MemoryManager:
         dev_pool = self._get_device_pool(device)
         dev_pool.push(pool_key, stored, self._pool_depth)
 
-    # ------------------------------------------------------------------
-    # Eviction and spilling
-    # ------------------------------------------------------------------
     def _evict_buffer(self, key: str, keep_metadata: bool = True) -> None:
         tensor_to_release: Optional[torch.Tensor] = None
         spill_args: Optional[tuple] = None
@@ -1518,7 +1515,6 @@ class MemoryManager:
         old_gen                = state.spill_generation
         new_gen                = old_gen + 1
         state.spill_generation = new_gen
-        # Protect the pending-writes dict with its dedicated lock
         with self._pending_writes_lock:
             self._pending_writes[key] = new_gen
         state.on_disk          = True
