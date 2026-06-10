@@ -42,6 +42,7 @@ _DEBUG             = os.environ.get("OPS_DEBUG", "0") == "1"
 _VALIDATION_SAMPLE = float(os.environ.get("OPS_VALIDATION_SAMPLE", "0.01"))
 _VALIDATION_LEVEL  = os.environ.get("OPS_VALIDATION", "basic")
 _VRAM_HEADROOM_FRAC = float(os.environ.get("OPS_VRAM_HEADROOM", "0.15"))
+_MAX_LAZY_FIELD_HANDLES = int(os.environ.get("OPS_MAX_LAZY_FIELD_HANDLES", "8")) 
 
 _call_counter = itertools.count()
 
@@ -2121,10 +2122,15 @@ class LazyField:
         except Exception:
             f = h5py.File(self.path, "r")
         self._local.file = f
-        self._local.file = f
         self._local.dset = None
         with self._lock:
             self._all_files.append(f)
+            if len(self._all_files) > _MAX_LAZY_FIELD_HANDLES:
+                old = self._all_files.pop(0)
+                try:
+                    old.close()
+                except Exception:
+                    pass
         for cand in (self.dataset_name, "data", "field"):
             if cand in f and isinstance(f[cand], h5py.Dataset):
                 self._local.dset = f[cand]
@@ -2812,26 +2818,3 @@ __all__ = [
     "_clear_k_grid_cache", "_vram_headroom_ok", "_vram_free_bytes",
     "_PINNED_POOL",
 ]
-stenpy.py
-
-Download original file
-
-stenpy.py
-
-Download original file
-not specified
-Free
-main.py and 2 other files
-2026-06-10
-︱
-3 files
-︱
-336.67 KB
-︱
-3 Views
-Will be deleted: Jun 24, 2026 05:27
-Save all files
-Share
-Actions
-Select
-Sort
