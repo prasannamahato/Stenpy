@@ -1123,9 +1123,6 @@ def _prompt_vram_flush(device: torch.device) -> None:
     if ans in ("", "y", "yes"): _flush_vram(device, verbose=True)
     else: print("  VRAM kept — remember to flush before large operations.")
 
-# ----------------------------------------------------------------------
-# VRAM-LEAK FIX B: aggressive VRAM release after each run
-# ----------------------------------------------------------------------
 def _release_graph_tensors(graph: stenpy.Graph, device: torch.device) -> None:
     if device.type != "cuda": return
     for nid in list(graph._nodes.keys()):
@@ -1390,9 +1387,6 @@ def _safe_mm_clear(mm: Any) -> None:
             else: _live.clear()
     except Exception: pass
 
-# ----------------------------------------------------------------------
-# Robust Chunk Sizing with Huge Safety Buffers
-# ----------------------------------------------------------------------
 def _compute_chunk_rows(
     full_shape:        Tuple[int, ...],
     device:            torch.device,
@@ -1866,9 +1860,6 @@ def _hdf5_safe_row_stream(
         "input_gb": bytes_in / 1024**3, "output_gb": out_gb,
     }
 
-# ----------------------------------------------------------------------
-# GPU-saturating direct-HDF5 chunked executor
-# ----------------------------------------------------------------------
 def _hdf5_direct_chunked_run(
     expr_str: str, field_paths: Dict[str, str], scalar_map: Dict[str, torch.Tensor],
     dx: float, boundary: str, out_path: str, spacing: Tuple, origin: Tuple,
@@ -2136,8 +2127,6 @@ def _hdf5_direct_chunked_run(
             with _make_bar(n_chunks_est, desc="Streaming", unit="chunk", colour="green") as bar:
                 while row_pos < total_rows:
                     if write_errors: raise RuntimeError(f"HDF5 write error: {write_errors[0]}")
-                    
-                    # Aggressive cleanup at top of loop
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                         torch.cuda.empty_cache()
