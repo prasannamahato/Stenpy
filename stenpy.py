@@ -1321,18 +1321,20 @@ def _grad2_along_dim(
     out = (right - left) * (0.5 / dx)
     return out.to(_DTYPE)
 
-
 def gradient(
     t:            torch.Tensor,
-    dim:          int   = 0,
     dx:           float = 1.0,
     boundary:     str   = "neumann",
-    vector_field: bool  = False,
     alloc=None,
 ) -> torch.Tensor:
     _assert_fp64(t, "gradient")
+    original_shape = t.shape
+    if t.shape[-1] == 1 and t.ndim > 1:
+        t = t[..., 0]
+
     grads = torch.gradient(t, spacing=dx, edge_order=2)
-    out = grads[dim]
+
+    out = torch.stack(grads, dim=-1)
     if alloc:
         buf = alloc(out.shape, out.device, key=_uid("grad"))
         buf.copy_(out)
@@ -1404,9 +1406,28 @@ def gradient_nd(
     alloc     = None,
 ) -> torch.Tensor:
     _assert_fp64(t, "gradient_nd")
-    D = t.ndim
-    grads = torch.gradient(t, spacing=dx, edge_order=2)
-    out = torch.stack(grads, dim=-1)        
+    original_shape = t.shape
+    t_squeezed = t.squeeze() 
+    
+    if t_squeezed.ndim != t.ndim:
+        kept_dims = [i for i, s in enumerate(original_shape) if s != 1]
+        D = t_squeezed.ndim
+    else:
+        D = t.ndim
+    
+    try:
+        grads = torch.gradient(t_squeezed, spacing=dx, edge_order=2)
+    except RuntimeError as e:
+        if "at least edge_order+1" in str(e):
+            grads = torch.gradient(t_squeezed, spacing=dx, edge_order=1)
+        else:
+            raise
+    
+    out = torch.stack(grads, dim=-1)
+    if out.shape[:-1] != original_shape:
+        new_shape = list(original_shape) + [out.shape[-1]]
+        out = out.reshape(new_shape)
+    
     if alloc:
         buf = alloc(out.shape, out.device, key=_uid("gradient_nd"))
         buf.copy_(out)
@@ -2791,3 +2812,26 @@ __all__ = [
     "_clear_k_grid_cache", "_vram_headroom_ok", "_vram_free_bytes",
     "_PINNED_POOL",
 ]
+stenpy.py
+
+Download original file
+
+stenpy.py
+
+Download original file
+not specified
+Free
+main.py and 2 other files
+2026-06-10
+︱
+3 files
+︱
+336.67 KB
+︱
+3 Views
+Will be deleted: Jun 24, 2026 05:27
+Save all files
+Share
+Actions
+Select
+Sort
