@@ -27,11 +27,9 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 def compute_flops(group: "FusionGroup") -> int:
-    """Total FLOPs per output element (scalar)."""
     return group.flops
 
 def compute_physical_bytes(group: "FusionGroup") -> int:
-    """Total physical bytes read+written per output element."""
     return group.bytes_read + group.bytes_written
 
 def arithmetic_intensity(group: "FusionGroup") -> float:
@@ -40,14 +38,12 @@ def arithmetic_intensity(group: "FusionGroup") -> float:
     return flops / bytes_ if bytes_ > 0 else float('inf')
 
 def estimate_registers(group: "FusionGroup") -> int:
-    """Estimate register usage: α*loads + β*ops + γ."""
     alpha, beta, gamma = 1.0, 0.5, 5
     loads = len(group.inputs)          
     ops = len(group.nodes)
     return int(alpha * loads + beta * ops + gamma)
 
 def estimate_occupancy(regs: int, max_regs_per_thread: int = 64) -> float:
-    """Occupancy fraction (0..1)."""
     if regs <= max_regs_per_thread:
         return 1.0
     return max(0.0, min(1.0, max_regs_per_thread / regs))
@@ -156,7 +152,6 @@ class FusionGroup:
 FUSIBLE_OPS = {"add","sub","mul","div","exp","log","sqrt","sin","cos","tanh","neg","laplacian"}
 
 def _broadcast_shapes(s1: Tuple[int, ...], s2: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
-    """Return common broadcast shape, or None if incompatible."""
     if s1 == s2:
         return s1
     r1, r2 = list(reversed(s1)), list(reversed(s2))
@@ -288,7 +283,6 @@ def plan_fusion(graph: "Graph") -> List[FusionGroup]:
 # ---------------------------------------------------------------------------
 
 def _default_strides(shape: Tuple[int, ...]) -> Tuple[int, ...]:
-    """Compute default C‑contiguous strides (in elements)."""
     strides = [1]
     for s in reversed(shape[1:]):
         strides.append(strides[-1] * s)
@@ -487,10 +481,6 @@ class TritonCodegen:
 
     def _broadcast_index(self, shape: Tuple[int, ...], strides: Tuple[int, ...],
                          ndim: int) -> str:
-        """
-        Returns a string expression for the linear index of this tensor
-        using the output coordinates (i, j, k) and broadcasting rules.
-        """
         rank_diff = ndim - len(shape)
         padded_shape = (1,) * rank_diff + shape
         padded_strides = (0,) * rank_diff + strides
@@ -560,7 +550,6 @@ class NormalNodeTask(ExecutionTask):
 
 
 def _compile_kernel_from_source(src: str):
-    """Compile Triton kernel source string into a callable kernel."""
     full_src = "import triton\nimport triton.language as tl\n" + src
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(full_src)
