@@ -36,6 +36,13 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
+_FUSION_ENABLED = os.environ.get("OPS_FUSION_ENABLED", "1").lower() in ("1", "true", "yes")
+try:
+    import fused_compiler as fc
+except ImportError:
+    fc = None
+    _FUSION_ENABLED = False
+
 _DTYPE = torch.float64
 
 _DEBUG             = os.environ.get("OPS_DEBUG", "0") == "1"
@@ -57,8 +64,8 @@ def _dbg(msg: str) -> None:
 
 
 def _assert_fp64(t: torch.Tensor, where: str) -> None:
-    if t.dtype != _DTYPE:
-        raise TypeError(f"{where}: expected float64, got {t.dtype}")
+    if t.dtype not in (_DTYPE, torch.complex128):
+        raise TypeError(f"{where}: expected float64 or complex128, got {t.dtype}")
 
 
 def _vram_headroom_ok(device: torch.device, needed_bytes: int = 0) -> bool:
@@ -134,6 +141,86 @@ def _lazy_to_gpu(
         return gpu_t, pinned
     t = torch.from_numpy(arr.astype(np.float64, copy=False)).to(_DTYPE)
     return t.to(device), None
+
+
+# ---------------------------------------------------------------------------
+# MPI detection and globals
+# ---------------------------------------------------------------------------
+
+_MPI_ACTIVE = False
+_MPI_COMM = None
+_MPI_RANK = 0
+_MPI_WORLD = 1
+
+
+def _detect_mpi():
+    """Detect if we're running under MPI and set globals"""
+    global _MPI_ACTIVE, _MPI_COMM, _MPI_RANK, _MPI_WORLD
+    if _HAS_MPI:
+        try:
+            _MPI_COMM = _MPI.COMM_WORLD
+            _MPI_RANK = _MPI_COMM.Get_rank()
+            _MPI_WORLD = _MPI_COMM.Get_size()
+            if _MPI_WORLD > 1:
+                _MPI_ACTIVE = True
+                _dbg(f"MPI detected: rank={_MPI_RANK}, world={_MPI_WORLD}")
+        except Exception:
+            _MPI_ACTIVE = False
+
+
+
+_detect_mpi()
+
+
+def _mpi_halo_exchange_1d_optimized(shard: torch.Tensor, radius: int) -> torch.Tensor:
+    """
+    Optimized idempotent halo exchange with overlapping communication.
+    Uses non-blocking sends/receives for maximum throughput.
+    """
+    global _MPI_ACTIVE, _MPI_COMM, _MPI_RANK, _MPI_WORLD
+    
+    if not _MPI_ACTIVE or radius <= 0 or _MPI_WORLD <= 1:
+        return shard
+
+    try_cuda_aware = shard.is_cuda and _MPI.Get_library_version().find("CUDA") != -1
+    
+    if not try_cuda_aware and shard.is_cuda:
+        device = shard.device
+        shard = shard.cpu()
+    
+    n_local = shard.shape[0]
+    left_rank = _MPI_RANK - 1 if _MPI_RANK > 0 else None
+    right_rank = _MPI_RANK + 1 if _MPI_RANK < _MPI_WORLD - 1 else None
+    
+    if n_local < 2 * radius:
+        return shard
+
+    send_left = shard[radius:2*radius].clone()
+    send_right = shard[-2*radius:-radius].clone()
+    recv_left = torch.zeros_like(send_left)
+    recv_right = torch.zeros_like(send_right)
+
+    reqs = []
+    
+    if left_rank is not None:
+        reqs.append(_MPI_COMM.Irecv(recv_left.numpy(), source=left_rank, tag=20))
+        reqs.append(_MPI_COMM.Isend(send_left.numpy().copy(), dest=left_rank, tag=10))
+    
+    if right_rank is not None:
+        reqs.append(_MPI_COMM.Irecv(recv_right.numpy(), source=right_rank, tag=10))
+        reqs.append(_MPI_COMM.Isend(send_right.numpy().copy(), dest=right_rank, tag=20))
+    
+    if reqs:
+        _MPI.Request.Waitall(reqs)
+    if left_rank is not None:
+        shard[:radius] = recv_left
+    if right_rank is not None:
+        shard[-radius:] = recv_right
+    
+    if not try_cuda_aware and shard.is_cuda:
+        shard = shard.to(device)
+    
+    return shard
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +363,10 @@ class MemoryManager:
     def should_manage(self, shape: Tuple[int, ...]) -> bool:
         return math.prod(shape) >= 1024
 
+    def advance_step(self) -> None:
+        """No-op for basic MemoryManager; advanced MM overrides this."""
+        pass
+
     def make_field(
         self,
         tensor:  torch.Tensor,
@@ -314,9 +405,36 @@ class MemoryManager:
         radius: int,
         dims:   Optional[List[int]] = None,
     ) -> torch.Tensor:
+        global _MPI_ACTIVE, _MPI_WORLD
+
+        if radius <= 0:
+            return shard
+
+        if _MPI_ACTIVE and _MPI_WORLD > 1:
+            if dims is None or 0 in dims:
+                return _mpi_halo_exchange_1d_optimized(shard, radius)
+            return shard
+
         return shard
 
     def all_reduce_sum(self, t: torch.Tensor) -> torch.Tensor:
+        global _MPI_ACTIVE, _MPI_COMM, _MPI_WORLD
+        
+        if _MPI_ACTIVE and _MPI_WORLD > 1:
+            was_cuda = t.is_cuda
+            if was_cuda:
+                device = t.device
+                t = t.cpu()
+            result_np = t.numpy().copy()
+            _MPI_COMM.Allreduce(_MPI.IN_PLACE, result_np, op=_MPI.SUM)
+            t_out = torch.from_numpy(result_np).to(_DTYPE)
+            if was_cuda:
+                t_out = t_out.to(device)
+            return t_out
+        if is_distributed():
+            out = t.clone()
+            dist.all_reduce(out, op=dist.ReduceOp.SUM)
+            return out
         return t
 
     def memory_pressure(self, device: Optional[torch.device] = None) -> float:
@@ -372,6 +490,8 @@ class Graph:
     def __init__(self) -> None:
         self._nodes: Dict[str, GraphNode] = {}
         self._order: List[str]            = []
+        self._dtypes: Dict[str, torch.dtype] = {} 
+        self._shapes: Dict[str, Tuple[int, ...]] = {}
 
     def add(
         self,
@@ -435,6 +555,23 @@ class Graph:
     def __repr__(self) -> str:
         return f"Graph({len(self._nodes)} nodes)"
 
+    def set_node_shape(self, node_id: str, shape: Tuple[int, ...],
+                       dtype: torch.dtype = torch.float64) -> None:
+        self._shapes[node_id] = tuple(shape)
+        self._dtypes[node_id] = dtype
+
+    def get_node_shape(self, node_id: str) -> Optional[Tuple[int, ...]]:
+        return self._shapes.get(node_id)
+
+    def get_node_dtype(self, node_id: str) -> torch.dtype:
+        return self._dtypes.get(node_id, torch.float64)
+
+    def build_consumer_map(self) -> Dict[str, List[str]]:
+        consumers = {nid: [] for nid in self._nodes}
+        for nid, node in self._nodes.items():
+            for dep in node.input_ids:
+                consumers[dep].append(nid)
+        return consumers
 
 # ---------------------------------------------------------------------------
 # Runtime helpers
@@ -485,12 +622,19 @@ class Runtime:
         mm:        MemoryManager,
         device:    Union[str, torch.device] = "cpu",
         skip_pool: bool                     = False,
+        fusion_enabled: bool                = None,
     ) -> None:
         self.mm         = mm
         _set_dist_mm(mm)
         self.device     = torch.device(device)
-        self._alloc_cache: Dict[str, bool]          = {}
+        self._alloc_cache: Dict[str, bool] = {}
         self.skip_pool  = skip_pool
+        if fusion_enabled is None:
+            fusion_enabled = _FUSION_ENABLED
+        if fusion_enabled and fc is None:
+            warnings.warn("fusion_compiler not found; fusion disabled", ImportWarning)
+            fusion_enabled = False
+        self.fusion_enabled = fusion_enabled
         self._h2d_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(self.device)
             if self.device.type == "cuda" and torch.cuda.is_available()
@@ -607,7 +751,6 @@ class Runtime:
             origin:     Optional[Tuple]    = None,
         ) -> Dict[str, Any]:
             import queue as _queue
-
             lazy_node_ids: List[str]           = []
             lazy_field:    Optional[LazyField] = None
             for nid in graph._order:
@@ -621,7 +764,7 @@ class Runtime:
 
             if lazy_field is None:
                 return self.run(graph)
-
+            
             total = lazy_field.shape[chunk_dim]
             if chunk_size is None:
                 chunk_size = self._auto_chunk_size(lazy_field, chunk_dim)
@@ -784,7 +927,42 @@ class Runtime:
                 }
             }
 
-    def run(
+    def run(self, graph, seed=None):
+        if self.fusion_enabled and self._should_fuse(graph):
+            try:
+                return self._run_fused(graph, seed)
+            except Exception as e:
+                warnings.warn(f"Fusion failed, falling back to original: {e}")
+        return self._run_original(graph, seed)
+
+    def _should_fuse(self, graph: Graph) -> bool:
+        if self.device.type != "cuda":
+            return False
+        if fc is None:
+            return False
+        for node in graph._nodes.values():
+            if node.op_name in fc.FUSIBLE_OPS:
+                return True
+        return False
+
+    def _run_fused(self, graph: Graph, seed: Optional[Dict] = None) -> Dict:
+        for nid, node in graph._nodes.items():
+            if nid not in graph._shapes:
+                if nid in (seed or {}):
+                    val = seed[nid]
+                    if isinstance(val, torch.Tensor):
+                        graph.set_node_shape(nid, val.shape, val.dtype)
+                elif len(node.input_ids) == 0:
+                    val = node.params.get("value")
+                    if isinstance(val, torch.Tensor):
+                        graph.set_node_shape(nid, val.shape, val.dtype)
+                    else:
+                        graph.set_node_shape(nid, (1,))
+                else:
+                    pass
+        return fc.compile_and_execute(graph, self, seed)
+
+    def _run_original(
         self,
         graph: Graph,
         seed:  Optional[Dict[str, Any]] = None,
@@ -798,7 +976,16 @@ class Runtime:
 
             inputs = []
             for i in node.input_ids:
-                val = results[i]
+                if i in results:
+                    val = results[i]
+                else:
+                    input_node = graph._nodes.get(i)
+                    if input_node and input_node.op_name == "_constant":
+                        val = input_node.params.get("value")
+                    else:
+                        raise RuntimeError(
+                            f"Input '{i}' for node '{node.id}' not found in results"
+                        )
                 if isinstance(val, LazyField):
                     arr = val[:]
                     val = (
@@ -841,10 +1028,13 @@ class Runtime:
                     )
                 else:
                     dims = static_dims
-                if is_distributed():
+
+                should_exchange = is_distributed() or (_MPI_ACTIVE and _MPI_WORLD > 1)
+                if should_exchange:
                     for inp in inputs:
                         if isinstance(inp, torch.Tensor):
                             _validate_halo_contract(inp, radius, dims, node.op_name)
+
                 inputs = [
                     self.mm.halo_exchange(i, radius, dims)
                     if isinstance(i, torch.Tensor) else i
@@ -852,25 +1042,7 @@ class Runtime:
                 ]
 
             output = None
-            if (
-                node.op_name in _FUSIBLE_OPS
-                and len(inputs) == 1
-                and isinstance(inputs[0], torch.Tensor)
-                and inputs[0].device.type == "cuda"
-            ):
-                t_in     = inputs[0]
-                expr_str = node.op_name
-                if not self.skip_pool and self.mm.should_manage(t_in.shape):
-                    out_buf = self.mm.allocate(
-                        t_in.shape, t_in.device,
-                        key=_uid(node.id + "_fused"),
-                    )
-                else:
-                    out_buf = torch.empty_like(t_in)
-                if _try_fused_dispatch(expr_str, {"f": t_in}, out_buf):
-                    output = out_buf.to(_DTYPE)
-
-            if output is None:
+            if True:
                 op_fn = OP_REGISTRY[node.op_name]
                 sig   = inspect.signature(op_fn)
                 params = sig.parameters
@@ -892,13 +1064,15 @@ class Runtime:
             output = _wrap(output)
 
             if isinstance(output, torch.Tensor):
-                _assert_fp64(output, node.op_name)
+                if not output.is_complex():
+                    _assert_fp64(output, node.op_name)
                 is_managed = self.mm.owns(output)
                 if is_managed and output._base is not None:
                     is_managed = False
                 if (
                     not self.skip_pool
                     and not is_managed
+                    and not output.is_complex()  
                     and self.mm.should_manage(output.shape)
                     and output.is_contiguous()
                 ):
@@ -923,12 +1097,13 @@ class Runtime:
                 if dep in ref_count:
                     ref_count[dep] -= 1
                     if ref_count[dep] <= 0 and dep in results:
-                        val = results.pop(dep)
-                        if isinstance(val, torch.Tensor) and self.mm.owns(val):
-                            self.mm.release(val)
+                        dep_node = graph._nodes.get(dep)
+                        if dep_node is None or dep_node.op_name != "_constant":
+                            val = results.pop(dep)
+                            if isinstance(val, torch.Tensor) and self.mm.owns(val):
+                                self.mm.release(val)
 
         return results
-
 
 # ---------------------------------------------------------------------------
 # Tile iterator
@@ -964,6 +1139,7 @@ def _tile_iter(
 # Operator registry
 # ---------------------------------------------------------------------------
 
+
 OP_REGISTRY: Dict[str, Callable] = {}
 OP_METADATA: Dict[str, dict]     = {}
 
@@ -971,11 +1147,15 @@ OP_METADATA: Dict[str, dict]     = {}
 def register_operator(
     name:          str,
     func:          Callable,
-    radius:        int                  = 0,
-    halo_l:        int                  = 0,
-    halo_r:        int                  = 0,
-    cost:          str                  = "low",
-    exchange_dims: Optional[List[int]]  = None,
+    radius:        int = 0,
+    halo_l:        int = 0,
+    halo_r:        int = 0,
+    cost:          str = "low",
+    exchange_dims: Optional[List[int]] = None,
+    flops:         int = 0,              
+    bytes_in:      int = 0,              
+    bytes_out:     int = 0,              
+    fp64_fusion:   bool = True,          
 ) -> None:
     OP_REGISTRY[name] = func
     OP_METADATA[name] = {
@@ -984,8 +1164,11 @@ def register_operator(
         "halo_right":     halo_r if halo_r else radius,
         "cost":           cost,
         "exchange_dims":  exchange_dims,
+        "flops_per_element": flops,
+        "bytes_read_per_element": bytes_in,
+        "bytes_written_per_element": bytes_out,
+        "supports_fp64_fusion": fp64_fusion,
     }
-
 
 # ---------------------------------------------------------------------------
 # Operators — arithmetic
@@ -998,7 +1181,7 @@ def _constant(*, value) -> torch.Tensor:
         raise TypeError(f"_constant: expected torch.Tensor or number, got {type(value).__name__}")
     return value.to(_DTYPE)
 
-register_operator("_constant", _constant, cost="low")
+register_operator("_constant", _constant, cost="low", flops=0, bytes_in=0, bytes_out=8)
 
 
 def add(a: torch.Tensor, b: torch.Tensor, alloc=None) -> torch.Tensor:
@@ -1008,7 +1191,7 @@ def add(a: torch.Tensor, b: torch.Tensor, alloc=None) -> torch.Tensor:
     out = alloc(torch.broadcast_shapes(a.shape, b.shape), a.device, key=_uid("add"))
     return torch.add(a, b, out=out)
 
-register_operator("add", add, cost="low")
+register_operator("add", add, cost="low", flops=1, bytes_in=16, bytes_out=8)
 
 
 def sub(a: torch.Tensor, b: torch.Tensor, alloc=None) -> torch.Tensor:
@@ -1018,17 +1201,22 @@ def sub(a: torch.Tensor, b: torch.Tensor, alloc=None) -> torch.Tensor:
     out = alloc(torch.broadcast_shapes(a.shape, b.shape), a.device, key=_uid("sub"))
     return torch.sub(a, b, out=out)
 
-register_operator("sub", sub, cost="low")
+register_operator("sub", sub, cost="low", flops=1, bytes_in=16, bytes_out=8)
 
 
-def mul(a: torch.Tensor, b: torch.Tensor, alloc=None) -> torch.Tensor:
+def mul(a: torch.Tensor, b: torch.Tensor = None,
+        scalar: float = None, alloc=None) -> torch.Tensor:
+    if scalar is not None and b is None:
+        b = torch.full_like(a, scalar, dtype=_DTYPE)
+    elif b is None:
+        raise ValueError("mul: must provide either a second tensor 'b' or 'scalar'")
     _assert_fp64(a, "mul(a)"); _assert_fp64(b, "mul(b)")
     if alloc is None:
         return torch.mul(a, b)
     out = alloc(torch.broadcast_shapes(a.shape, b.shape), a.device, key=_uid("mul"))
     return torch.mul(a, b, out=out)
 
-register_operator("mul", mul, cost="low")
+register_operator("mul", mul, cost="low", flops=1, bytes_in=16, bytes_out=8)
 
 
 def div(
@@ -1047,7 +1235,7 @@ def div(
     out = alloc(torch.broadcast_shapes(a.shape, b.shape), a.device, key=_uid("div"))
     return torch.div(a, b_safe, out=out)
 
-register_operator("div", div, cost="low")
+register_operator("div", div, cost="low", flops=1, bytes_in=16, bytes_out=8)
 
 
 def neg(a: torch.Tensor, alloc=None) -> torch.Tensor:
@@ -1057,7 +1245,7 @@ def neg(a: torch.Tensor, alloc=None) -> torch.Tensor:
     out = alloc(a.shape, a.device, key=_uid("neg"))
     return torch.neg(a, out=out)
 
-register_operator("neg", neg, cost="low")
+register_operator("neg", neg, cost="low", flops=1, bytes_in=8, bytes_out=8)
 
 
 def clamp(
@@ -1072,7 +1260,7 @@ def clamp(
     out = alloc(a.shape, a.device, key=_uid("clamp"))
     return torch.clamp(a, lo, hi, out=out)
 
-register_operator("clamp", clamp, cost="low")
+register_operator("clamp", clamp, cost="low", flops=2, bytes_in=8, bytes_out=8)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1274,7 @@ def exp(a: torch.Tensor, alloc=None) -> torch.Tensor:
     out = alloc(a.shape, a.device, key=_uid("exp"))
     return torch.exp(a, out=out)
 
-register_operator("exp", exp, cost="medium")
+register_operator("exp", exp, cost="medium", flops=8, bytes_in=8, bytes_out=8)
 
 
 def log(a: torch.Tensor, eps: float = 1e-15, alloc=None) -> torch.Tensor:
@@ -1096,7 +1284,7 @@ def log(a: torch.Tensor, eps: float = 1e-15, alloc=None) -> torch.Tensor:
     out = alloc(a.shape, a.device, key=_uid("log"))
     return torch.log(a.clamp(min=eps), out=out)
 
-register_operator("log", log, cost="medium")
+register_operator("log", log, cost="medium", flops=8, bytes_in=8, bytes_out=8)
 
 
 def sqrt(a: torch.Tensor, eps: float = 0.0, alloc=None) -> torch.Tensor:
@@ -1106,7 +1294,7 @@ def sqrt(a: torch.Tensor, eps: float = 0.0, alloc=None) -> torch.Tensor:
     out = alloc(a.shape, a.device, key=_uid("sqrt"))
     return torch.sqrt(a.clamp(min=eps), out=out)
 
-register_operator("sqrt", sqrt, cost="medium")
+register_operator("sqrt", sqrt, cost="medium", flops=8, bytes_in=8, bytes_out=8)
 
 
 def sin(a: torch.Tensor, alloc=None) -> torch.Tensor:
@@ -1116,7 +1304,16 @@ def sin(a: torch.Tensor, alloc=None) -> torch.Tensor:
     out = alloc(a.shape, a.device, key=_uid("sin"))
     return torch.sin(a, out=out)
 
-register_operator("sin", sin, cost="medium")
+register_operator("sin", sin, cost="medium", flops=8, bytes_in=8, bytes_out=8)
+
+def cos(a: torch.Tensor, alloc=None) -> torch.Tensor:
+    _assert_fp64(a, "cos(a)")
+    if alloc is None:
+        return torch.cos(a)
+    out = alloc(a.shape, a.device, key=_uid("cos"))
+    return torch.cos(a, out=out)
+
+register_operator("cos", cos, cost="medium", flops=8, bytes_in=8, bytes_out=8)
 
 
 def tanh(a: torch.Tensor, alloc=None) -> torch.Tensor:
@@ -1126,7 +1323,7 @@ def tanh(a: torch.Tensor, alloc=None) -> torch.Tensor:
     out = alloc(a.shape, a.device, key=_uid("tanh"))
     return torch.tanh(a, out=out)
 
-register_operator("tanh", tanh, cost="medium")
+register_operator("tanh", tanh, cost="medium", flops=8, bytes_in=8, bytes_out=8, fp64_fusion=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1177,62 +1374,59 @@ def _pad1d(t: torch.Tensor, dim: int, r: int, bc: str) -> torch.Tensor:
             sl[dim] = -(i+1);     padded[tuple(sl)] = t[(slice(None),) * dim + (src_hi,)]
     return padded
 
-
 @triton.jit
 def laplacian_3d_kernel(
     x_ptr, out_ptr,
     nx, ny, nz,
     dx2, dy2, dz2,
-    periodic: tl.constexpr,
-    BLOCK_X:  tl.constexpr,
-    BLOCK_Y:  tl.constexpr,
-    BLOCK_Z:  tl.constexpr,
+    boundary_mode: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    pid_x = tl.program_id(0)
-    pid_y = tl.program_id(1)
-    pid_z = tl.program_id(2)
-    off_x = pid_x * BLOCK_X + tl.arange(0, BLOCK_X)
-    off_y = pid_y * BLOCK_Y + tl.arange(0, BLOCK_Y)
-    off_z = pid_z * BLOCK_Z + tl.arange(0, BLOCK_Z)
-    mask  = (off_x < nx) & (off_y < ny) & (off_z < nz)
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < (nx * ny * nz)
 
-    def idx(x, y, z):
-        return x * (ny * nz) + y * nz + z
+    i = offsets // (ny * nz)
+    j = (offsets // nz) % ny
+    k = offsets % nz
 
-    if periodic:
-        xm = (off_x - 1) % nx;  xp = (off_x + 1) % nx
-        ym = (off_y - 1) % ny;  yp = (off_y + 1) % ny
-        zm = (off_z - 1) % nz;  zp = (off_z + 1) % nz
-    else:
-        xm = tl.maximum(off_x-1, 0);  xp = tl.minimum(off_x+1, nx-1)
-        ym = tl.maximum(off_y-1, 0);  yp = tl.minimum(off_y+1, ny-1)
-        zm = tl.maximum(off_z-1, 0);  zp = tl.minimum(off_z+1, nz-1)
+    idx_c = i * (ny * nz) + j * nz + k
+    c = tl.load(x_ptr + idx_c, mask=mask, other=0.0)
 
-    c   = tl.load(x_ptr + idx(off_x, off_y, off_z), mask=mask, other=0.0)
-    fxm = tl.load(x_ptr + idx(xm,    off_y, off_z), mask=mask, other=0.0)
-    fxp = tl.load(x_ptr + idx(xp,    off_y, off_z), mask=mask, other=0.0)
-    fym = tl.load(x_ptr + idx(off_x, ym,    off_z), mask=mask, other=0.0)
-    fyp = tl.load(x_ptr + idx(off_x, yp,    off_z), mask=mask, other=0.0)
-    fzm = tl.load(x_ptr + idx(off_x, off_y, zm   ), mask=mask, other=0.0)
-    fzp = tl.load(x_ptr + idx(off_x, off_y, zp   ), mask=mask, other=0.0)
+    if boundary_mode == 0:       
+        im = (i - 1 + nx) % nx; ip = (i + 1) % nx
+        jm = (j - 1 + ny) % ny; jp = (j + 1) % ny
+        km = (k - 1 + nz) % nz; kp = (k + 1) % nz
+    else:                         
+        im = tl.where(i - 1 >= 0, i - 1, 0);   ip = tl.where(i + 1 < nx, i + 1, nx - 1)
+        jm = tl.where(j - 1 >= 0, j - 1, 0);   jp = tl.where(j + 1 < ny, j + 1, ny - 1)
+        km = tl.where(k - 1 >= 0, k - 1, 0);   kp = tl.where(k + 1 < nz, k + 1, nz - 1)
+
+    idx_xm = im * (ny * nz) + j * nz + k
+    idx_xp = ip * (ny * nz) + j * nz + k
+    idx_ym = i * (ny * nz) + jm * nz + k
+    idx_yp = i * (ny * nz) + jp * nz + k
+    idx_zm = i * (ny * nz) + j * nz + km
+    idx_zp = i * (ny * nz) + j * nz + kp
+
+    fxm = tl.load(x_ptr + idx_xm, mask=mask, other=0.0)
+    fxp = tl.load(x_ptr + idx_xp, mask=mask, other=0.0)
+    fym = tl.load(x_ptr + idx_ym, mask=mask, other=0.0)
+    fyp = tl.load(x_ptr + idx_yp, mask=mask, other=0.0)
+    fzm = tl.load(x_ptr + idx_zm, mask=mask, other=0.0)
+    fzp = tl.load(x_ptr + idx_zp, mask=mask, other=0.0)
 
     lap = ((fxp + fxm - 2.0*c) / dx2 +
            (fyp + fym - 2.0*c) / dy2 +
            (fzp + fzm - 2.0*c) / dz2)
-    tl.store(out_ptr + idx(off_x, off_y, off_z), lap, mask=mask)
+    tl.store(out_ptr + idx_c, lap, mask=mask)
 
 
 class Laplacian:
     def __init__(self, boundary: str = "periodic") -> None:
         self.boundary = boundary
 
-    def _normalize_dx(
-        self,
-        dx:     Any,
-        D:      int,
-        device: torch.device,
-        dtype:  torch.dtype,
-    ) -> torch.Tensor:
+    def _normalize_dx(self, dx, D, device, dtype):
         if isinstance(dx, (int, float)):
             return torch.full((D,), float(dx), device=device, dtype=dtype)
         dx = torch.tensor(dx, device=device, dtype=dtype)
@@ -1243,64 +1437,45 @@ class Laplacian:
     def __call__(self, x: torch.Tensor, dx: Any = 1.0) -> torch.Tensor:
         D  = x.ndim
         dv = self._normalize_dx(dx, D, x.device, x.dtype)
-
-        if x.is_cuda and D == 3 and self.boundary == "periodic":
+        if x.is_cuda and D == 3:
             try:
                 x_c = x.contiguous()
                 out = torch.empty_like(x_c)
-                nx, ny, nz = x_c.shape
-                BX, BY, BZ = 8, 8, 8
-                grid = (triton.cdiv(nx, BX), triton.cdiv(ny, BY), triton.cdiv(nz, BZ))
+                total = math.prod(x_c.shape)
+                BLOCK = 512
+                grid = (triton.cdiv(total, BLOCK),)
+                boundary_mode = 0 if self.boundary == "periodic" else 1
                 laplacian_3d_kernel[grid](
-                    x_c, out, nx, ny, nz,
+                    x_c, out,
+                    x_c.shape[0], x_c.shape[1], x_c.shape[2],
                     float(dv[0]**2), float(dv[1]**2), float(dv[2]**2),
-                    True, BLOCK_X=BX, BLOCK_Y=BY, BLOCK_Z=BZ,
+                    boundary_mode,
+                    BLOCK_SIZE=BLOCK,
                 )
                 return out
-            except Exception:
-                pass
-
-        if x.is_cuda and D == 2 and x.numel() > 10_000:
-            try:
-                dx2 = float(dv[0])**2;  dy2 = float(dv[1])**2
-                kernel = torch.tensor(
-                    [[0, 1/dy2, 0],
-                     [1/dx2, -2/dx2 - 2/dy2, 1/dx2],
-                     [0, 1/dy2, 0]],
-                    dtype=x.dtype, device=x.device,
-                ).view(1, 1, 3, 3)
-                return F.conv2d(x.view(1, 1, *x.shape), kernel, padding=1).view(x.shape)
-            except Exception:
-                pass
-
-        if x.is_cuda and D == 3 and self.boundary != "periodic":
-            try:
-                dx2 = float(dv[0])**2;  dy2 = float(dv[1])**2;  dz2 = float(dv[2])**2
-                kernel = torch.zeros(1, 1, 3, 3, 3, device=x.device, dtype=x.dtype)
-                kernel[0,0,1,1,0]=1/dz2; kernel[0,0,1,1,2]=1/dz2
-                kernel[0,0,1,0,1]=1/dy2; kernel[0,0,1,2,1]=1/dy2
-                kernel[0,0,0,1,1]=1/dx2; kernel[0,0,2,1,1]=1/dx2
-                kernel[0,0,1,1,1]=-2/dx2-2/dy2-2/dz2
-                return F.conv3d(x.view(1,1,*x.shape), kernel, padding=1).view(x.shape)
-            except Exception:
-                pass
+            except Exception as e:
+                if _DEBUG:
+                    print(f"Triton kernel failed, using GPU torch.roll fallback: {e}")
 
         out = torch.zeros_like(x)
         for d in range(D):
-            xp = torch.roll(x, shifts=-1, dims=d)
-            xm = torch.roll(x, shifts=+1, dims=d)
-            if self.boundary != "periodic":
-                slc = [slice(None)] * D
-                slc[d] = 0;   xm[tuple(slc)] = x[tuple(slc)]
-                slc[d] = -1;  xp[tuple(slc)] = x[tuple(slc)]
-            out.add_((xp + xm - 2.0*x) / (dv[d]**2))
+            if self.boundary == "periodic":
+                xp = torch.roll(x, -1, d)
+                xm = torch.roll(x,  1, d)
+            else:
+                padded = _pad1d(x, d, 1, self.boundary)
+                N = x.shape[d]
+                xp = padded.narrow(d, 2, N)
+                xm = padded.narrow(d, 0, N)
+            out.add_((xp + xm - 2.0 * x) / (dv[d] ** 2))
         return out
 
 
 def laplacian(x: torch.Tensor, dx: Any = 1.0, boundary: str = "periodic") -> torch.Tensor:
     return Laplacian(boundary)(x, dx)
 
-register_operator("laplacian", laplacian, radius=1, cost="high", exchange_dims=None)
+register_operator("laplacian", laplacian, radius=1, cost="high", exchange_dims=[0],
+                  flops=8, bytes_in=56, bytes_out=8, fp64_fusion=True)
 
 
 
@@ -1323,18 +1498,59 @@ def _grad2_along_dim(
     return out.to(_DTYPE)
 
 def gradient(
-    t:            torch.Tensor,
-    dx:           float = 1.0,
-    boundary:     str   = "neumann",
+    t: torch.Tensor,
+    dx: float = 1.0,
+    boundary: str = "neumann",
+    dim: Optional[int] = None,
     alloc=None,
 ) -> torch.Tensor:
     _assert_fp64(t, "gradient")
-    original_shape = t.shape
-    if t.shape[-1] == 1 and t.ndim > 1:
-        t = t[..., 0]
+    use_distributed = _MPI_ACTIVE and _MPI_WORLD > 1 and boundary == "periodic"
+    periodic = (boundary == "periodic")
 
-    grads = torch.gradient(t, spacing=dx, edge_order=2)
+    if dim is not None:
+        if t.shape[dim] == 1:
+            result = torch.zeros_like(t)
+            if alloc:
+                buf = alloc(result.shape, result.device, key=_uid("grad"))
+                buf.copy_(result)
+                return buf
+            return result
 
+        if use_distributed and dim == 0:
+            left   = t[0:-2]
+            right  = t[2:]
+            grad = torch.zeros_like(t)
+            grad[1:-1] = (right - left) / (2.0 * dx)
+        elif periodic:
+            xp = torch.roll(t, shifts=-1, dims=dim)
+            xm = torch.roll(t, shifts=1, dims=dim)
+            grad = (xp - xm) / (2.0 * dx)
+        else:
+            order = 2 if t.shape[dim] >= 3 else 1
+            grad = torch.gradient(t, spacing=dx, dim=dim, edge_order=order)[0]
+
+        if alloc:
+            buf = alloc(grad.shape, grad.device, key=_uid("grad"))
+            buf.copy_(grad)
+            return buf
+        return grad
+
+    grads = []
+    for d in range(t.ndim):
+        if use_distributed and d == 0:
+            left   = t[0:-2]
+            right  = t[2:]
+            g = torch.zeros_like(t)
+            g[1:-1] = (right - left) / (2.0 * dx)
+        elif periodic:
+            xp = torch.roll(t, shifts=-1, dims=d)
+            xm = torch.roll(t, shifts=1, dims=d)
+            g = (xp - xm) / (2.0 * dx)
+        else:
+            order = 2 if t.shape[d] >= 3 else 1
+            g = torch.gradient(t, spacing=dx, dim=d, edge_order=order)[0]
+        grads.append(g)
     out = torch.stack(grads, dim=-1)
     if alloc:
         buf = alloc(out.shape, out.device, key=_uid("grad"))
@@ -1342,31 +1558,46 @@ def gradient(
         return buf
     return out
 
-register_operator("gradient", gradient, radius=1, cost="medium", exchange_dims=None)
+register_operator("gradient", gradient, radius=1, cost="medium", exchange_dims=[0])
 
 
 def divergence(
-    t:        torch.Tensor,
-    dx:       Union[float, Tuple[float, ...]] = 1.0,
+    t: torch.Tensor,
+    dx: Union[float, Tuple[float, ...]] = 1.0,
     boundary: str = "neumann",
     alloc=None,
 ) -> torch.Tensor:
     _assert_fp64(t, "divergence")
-    D = t.shape[-1]                     
+    D = t.shape[-1]
     if isinstance(dx, (int, float)):
         dx = (dx,) * D
+
+    use_distributed = _MPI_ACTIVE and _MPI_WORLD > 1 and boundary == "periodic"
+    periodic = (boundary == "periodic")
+
     out = torch.zeros_like(t[..., 0])
     for d in range(D):
         comp = t[..., d]
-        grad = torch.gradient(comp, spacing=dx[d], dim=d, edge_order=2)[0]   
+        if use_distributed and d == 0:
+            left   = comp[0:-2]
+            right  = comp[2:]
+            grad = torch.zeros_like(comp)
+            grad[1:-1] = (right - left) / (2.0 * dx[d])
+        elif periodic:
+            xp = torch.roll(comp, shifts=-1, dims=d)
+            xm = torch.roll(comp, shifts=1, dims=d)
+            grad = (xp - xm) / (2.0 * dx[d])
+        else:
+            grad = torch.gradient(comp, spacing=dx[d], dim=d, edge_order=2)[0]
         out += grad
+
     if alloc:
         buf = alloc(out.shape, out.device, key=_uid("div"))
         buf.copy_(out)
         return buf
     return out
 
-register_operator("divergence", divergence, radius=1, cost="medium", exchange_dims=None)
+register_operator("divergence", divergence, radius=1, cost="medium", exchange_dims=[0])
 
 
 def curl(
@@ -1380,49 +1611,72 @@ def curl(
         raise ValueError(f"curl: need (*spatial, 3), got {tuple(t.shape)}")
     if isinstance(dx, (int, float)):
         dx = (dx,) * 3
-    def _grad_all(comp):
-        return torch.gradient(comp, spacing=dx, edge_order=2) 
 
-    g0 = _grad_all(t[..., 0])
-    g1 = _grad_all(t[..., 1])
-    g2 = _grad_all(t[..., 2])
-
-    curl_x = g2[1] - g1[2]   
-    curl_y = g0[2] - g2[0]   
-    curl_z = g1[0] - g0[1]   
+    use_distributed = _MPI_ACTIVE and _MPI_WORLD > 1 and boundary == "periodic"
+    
+    if use_distributed:
+        g0 = gradient(t[..., 0], dx=dx, boundary=boundary, dim=None)
+        g1 = gradient(t[..., 1], dx=dx, boundary=boundary, dim=None)
+        g2 = gradient(t[..., 2], dx=dx, boundary=boundary, dim=None)
+        
+        curl_x = g2[..., 1] - g1[..., 2]
+        curl_y = g0[..., 2] - g2[..., 0]
+        curl_z = g1[..., 0] - g0[..., 1]
+    else:
+        def _grad_all(comp):
+            return torch.gradient(comp, spacing=dx, edge_order=2)
+        
+        g0 = _grad_all(t[..., 0])
+        g1 = _grad_all(t[..., 1])
+        g2 = _grad_all(t[..., 2])
+        
+        curl_x = g2[1] - g1[2]
+        curl_y = g0[2] - g2[0]
+        curl_z = g1[0] - g0[1]
+    
     out = torch.stack([curl_x, curl_y, curl_z], dim=-1)
     if alloc:
         buf = alloc(out.shape, out.device, key=_uid("curl"))
         buf.copy_(out)
         return buf
     return out
-
 register_operator("curl", curl, radius=1, cost="high", exchange_dims=None)
 
 
 def gradient_nd(
-    t:        torch.Tensor,
-    dx:       Union[float, Tuple[float, ...]] = 1.0,
+    t: torch.Tensor,
+    dx: Union[float, Tuple[float, ...]] = 1.0,
     boundary: str = "neumann",
-    alloc     = None,
+    dim: Optional[int] = None, 
+    alloc=None,
 ) -> torch.Tensor:
     _assert_fp64(t, "gradient_nd")
+
     original_shape = t.shape
-    t_squeezed = t.squeeze() 
+    t_squeezed = t
+    squeeze_dims = []
+    for i, s in enumerate(t.shape):
+        if s == 1:
+            squeeze_dims.append(i)
+    if squeeze_dims and t.squeeze().ndim > 0:
+        t_squeezed = t.squeeze()
     
-    if t_squeezed.ndim != t.ndim:
-        kept_dims = [i for i, s in enumerate(original_shape) if s != 1]
-        D = t_squeezed.ndim
-    else:
-        D = t.ndim
+    if t_squeezed.ndim == 0:
+        result = torch.zeros(original_shape + (0,), device=t.device, dtype=_DTYPE)
+        if alloc:
+            buf = alloc(result.shape, result.device, key=_uid("gradient_nd"))
+            buf.copy_(result)
+            return buf
+        return result
+    
+    D = t_squeezed.ndim
+    min_size = min(t_squeezed.shape)
+    order = 2 if min_size >= 3 else 1
     
     try:
-        grads = torch.gradient(t_squeezed, spacing=dx, edge_order=2)
-    except RuntimeError as e:
-        if "at least edge_order+1" in str(e):
-            grads = torch.gradient(t_squeezed, spacing=dx, edge_order=1)
-        else:
-            raise
+        grads = torch.gradient(t_squeezed, spacing=dx, edge_order=order)
+    except RuntimeError:
+        grads = torch.gradient(t_squeezed, spacing=dx, edge_order=1)
     
     out = torch.stack(grads, dim=-1)
     if out.shape[:-1] != original_shape:
@@ -1859,7 +2113,30 @@ def determinant(t: torch.Tensor, alloc=None) -> torch.Tensor:
     _assert_fp64(t, "determinant")
     if t.ndim < 2 or t.shape[-1] != t.shape[-2]:
         raise ValueError(f"determinant: need (*spatial, D, D), got {tuple(t.shape)}")
-    return torch.linalg.det(t).to(_DTYPE)
+    
+    D = t.shape[-1]
+    epsilon = 1e-12
+    I_reg = torch.eye(D, dtype=_DTYPE, device=t.device)
+
+    diag = torch.diagonal(t, dim1=-2, dim2=-1)
+    if (diag.abs() < epsilon).any():
+        t_reg = t + epsilon * I_reg
+    else:
+        t_reg = t
+    
+    try:
+        det = torch.linalg.det(t_reg)
+    except RuntimeError:
+        det = torch.linalg.det(t + 1e-6 * I_reg)
+    
+    det = torch.nan_to_num(det, nan=0.0, posinf=1e30, neginf=-1e30)
+    det = torch.clamp(det, min=-1e30, max=1e30)
+    
+    if alloc:
+        buf = alloc(det.shape, det.device, key=_uid("det"))
+        buf.copy_(det)
+        return buf
+    return det.to(_DTYPE)
 
 register_operator("determinant", determinant, cost="high")
 
@@ -1881,15 +2158,77 @@ def inverse(t: torch.Tensor, alloc=None) -> torch.Tensor:
 
 register_operator("inverse", inverse, cost="very_high")
 
+# ---------------------------------------------------------------------------
+# GPU-accelerated batched matrix multiply
+# ---------------------------------------------------------------------------
+def matmul_batched_gpu(
+    a: torch.Tensor,
+    alloc=None,
+) -> torch.Tensor:
+    """Batched A @ Aᵀ  (uses torch.bmm)."""
+    n = a.shape[-1]
+    b = a.reshape(-1, n, n)                     
+    r = b @ b.transpose(-1, -2)             
+    return r.reshape(*a.shape[:-2], n, n)     
+
+register_operator(
+    "matmul_batched_custom", matmul_batched_gpu,   
+    cost="high", flops=2, bytes_in=8, bytes_out=8,
+)
+
+
+# ---------------------------------------------------------------------------
+# GPU-accelerated 3×3×3 convolution (Gaussian blur)
+# ---------------------------------------------------------------------------
+
+def conv3d_spectral(a: torch.Tensor, alloc=None) -> torch.Tensor:
+    _assert_fp64(a, "conv3d_spectral")
+
+    if not hasattr(conv3d_spectral, "kernel"):
+        k = torch.tensor(
+            [[[1, 2, 1], [2, 4, 2], [1, 2, 1]],
+             [[2, 4, 2], [4, 8, 4], [2, 4, 2]],
+             [[1, 2, 1], [2, 4, 2], [1, 2, 1]]],
+            dtype=_DTYPE,
+        ) / 64.0
+        conv3d_spectral.kernel = k
+
+    kernel = conv3d_spectral.kernel.to(a.device)
+    s = a.shape
+
+    k_full = torch.zeros(s, dtype=a.dtype, device=a.device)
+
+    k_full[:3, :3, :3] = kernel
+ 
+    k_full = torch.roll(k_full, shifts=(-1, -1, -1), dims=(0, 1, 2))
+
+    A = torch.fft.fftn(a)
+    K = torch.fft.fftn(k_full)
+    C = torch.fft.ifftn(A * K)
+
+    return C.real.to(_DTYPE)
+
+register_operator(
+    "conv3d_spectral", conv3d_spectral,
+    cost="very_high", flops=2, bytes_in=8, bytes_out=8,
+)
 
 def deviatoric(t: torch.Tensor, alloc=None) -> torch.Tensor:
     _assert_fp64(t, "deviatoric")
     if t.ndim < 2 or t.shape[-1] != t.shape[-2]:
         raise ValueError(f"deviatoric: need (*spatial, D, D), got {tuple(t.shape)}")
+    
     D  = t.shape[-1]
     tr = torch.diagonal(t, dim1=-2, dim2=-1).sum(-1, keepdim=True).unsqueeze(-1)
-    I  = torch.eye(D, dtype=_DTYPE, device=t.device)
-    return (t - (tr / D) * I).to(_DTYPE)
+    I = torch.eye(D, dtype=_DTYPE, device=t.device)
+    result = t - (tr / max(D, 1e-15)) * I
+    result = torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if alloc:
+        buf = alloc(result.shape, result.device, key=_uid("deviatoric"))
+        buf.copy_(result)
+        return buf
+    return result.to(_DTYPE)
 
 register_operator("deviatoric", deviatoric, cost="medium")
 
@@ -1925,51 +2264,21 @@ register_operator("ifft", ifft, cost="high")
 
 def fft_complex(t: torch.Tensor, norm: str = "backward", alloc=None) -> torch.Tensor:
     _assert_fp64(t, "fft_complex")
-    
     if norm == "numpy_compatible":
         norm = "backward"
-    
-    if t.device.type == "cuda":
-        t_cpu = t.cpu()
-    else:
-        t_cpu = t
-    
-    result = torch.fft.fftn(t_cpu, norm=norm)
-    
-    if t.device.type == "cuda":
-        result = result.to(t.device)
-    
+    result = torch.fft.fftn(t, norm=norm)
     if alloc:
-        buf = alloc(result.shape, result.device, key=_uid("fft_complex"))
-        buf.copy_(result)
-        return buf
-    
+        return result        
     return result
 
-
 def ifft_complex(t: torch.Tensor, norm: str = "backward", alloc=None) -> torch.Tensor:
-
     if not torch.is_complex(t):
         t = torch.complex(t, torch.zeros_like(t))
-    
     if norm == "numpy_compatible":
         norm = "backward"
-    
-    if t.device.type == "cuda":
-        t_cpu = t.cpu()
-    else:
-        t_cpu = t
-    
-    result = torch.fft.ifftn(t_cpu, norm=norm)
-    
-    if t.device.type == "cuda":
-        result = result.to(t.device)
-    
+    result = torch.fft.ifftn(t, norm=norm)
     if alloc:
-        buf = alloc(result.shape, result.device, key=_uid("ifft_complex"))
-        buf.copy_(result)
-        return buf
-    
+        return result          
     return result
 
 
@@ -2117,13 +2426,19 @@ class LazyField:
     def _ensure_open(self) -> None:
         if getattr(self._local, "file", None) is not None:
             return
-        try:
-            f = h5py.File(self.path, "r", swmr=True)
-        except Exception:
-            f = h5py.File(self.path, "r")
-        self._local.file = f
-        self._local.dset = None
+        
+
         with self._lock:
+            if getattr(self._local, "file", None) is not None:
+                return
+            try:
+                f = h5py.File(self.path, "r", swmr=True)
+            except Exception:
+                f = h5py.File(self.path, "r")
+            
+            self._local.file = f
+            self._local.dset = None
+            
             self._all_files.append(f)
             if len(self._all_files) > _MAX_LAZY_FIELD_HANDLES:
                 old = self._all_files.pop(0)
@@ -2131,17 +2446,20 @@ class LazyField:
                     old.close()
                 except Exception:
                     pass
-        for cand in (self.dataset_name, "data", "field"):
-            if cand in f and isinstance(f[cand], h5py.Dataset):
-                self._local.dset = f[cand]
-                break
-        if self._local.dset is None:
-            for k in f:
-                if isinstance(f[k], h5py.Dataset):
-                    self._local.dset = f[k]
+
+            for cand in (self.dataset_name, "data", "field"):
+                if cand in f and isinstance(f[cand], h5py.Dataset):
+                    self._local.dset = f[cand]
                     break
-        if self._local.dset is None:
-            raise KeyError(f"No array dataset found in {self.path}")
+            
+            if self._local.dset is None:
+                for k in f:
+                    if isinstance(f[k], h5py.Dataset):
+                        self._local.dset = f[k]
+                        break
+            
+            if self._local.dset is None:
+                raise KeyError(f"No array dataset found in {self.path}")
 
     @property
     def shape(self) -> Tuple:
