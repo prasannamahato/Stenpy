@@ -45,7 +45,6 @@ else:
 # ----------------------------------------------------------------------
 # Configuration from environment
 # ----------------------------------------------------------------------
-
 CPU_PRESSURE_HIGH  = float(os.environ.get("OPS_MM_CPU_PRESSURE_HIGH", "0.75"))
 CPU_PRESSURE_LOW   = float(os.environ.get("OPS_MM_CPU_PRESSURE_LOW",  "0.65"))
 GPU_FRACTION       = float(os.environ.get("OPS_MM_GPU_FRACTION",      "0.8"))
@@ -61,8 +60,7 @@ DEBUG              = os.environ.get("OPS_DEBUG", "0") == "1"
 
 _WRITE_BATCH_SIZE  = int(os.environ.get("OPS_MM_WRITE_BATCH", "4"))
 
-
-_COMPRESS_KWARGS: Dict[str, Any] = {} 
+_COMPRESS_KWARGS: Dict[str, Any] = {}
 
 class DataLossError(RuntimeError):
     """Raised when a spill file is missing or corrupted on reload."""
@@ -168,8 +166,8 @@ class AdaptiveThrottler:
         with self._lock:
             return self._sleep
 
+
 class BuddyAllocator:
-    
     def __init__(self, total_size: int, min_block: int = 1024) -> None:
         self.total_size = total_size
         self.min_block = min_block
@@ -189,7 +187,7 @@ class BuddyAllocator:
         req_blocks = (size + self.min_block - 1) // self.min_block
         return max(0, (req_blocks - 1).bit_length())
 
-    def allocate(self, size: int, key: str) -> Tuple[int, int]:  
+    def allocate(self, size: int, key: str) -> Tuple[int, int]:
         with self._lock:
             order = self._order(size)
             for o in range(order, self.max_order + 1):
@@ -204,7 +202,7 @@ class BuddyAllocator:
                     return addr, block_size
             raise MemoryError(f"BuddyAllocator: cannot allocate {size} bytes")
 
-    def free(self, key: str) -> None:  
+    def free(self, key: str) -> None:
         with self._lock:
             if key not in self.allocations:
                 return
@@ -232,7 +230,6 @@ class BuddyAllocator:
 
 
 class PerDevicePool:
-
     def __init__(self, device: torch.device) -> None:
         self.device = device
         self._lock  = threading.RLock()
@@ -250,13 +247,15 @@ class PerDevicePool:
             return lst.pop() if lst else None
 
     def push(self, pool_key: Tuple, tensor: torch.Tensor, max_depth: int) -> None:
+        evicted = None
         with self._lock:
             lst = self._pools.setdefault(pool_key, [])
             if len(lst) < max_depth:
                 lst.append(tensor)
             elif lst:
-                lst.pop(0)
+                evicted = lst.pop(0)
                 lst.append(tensor)
+        del evicted
 
     def clear(self) -> None:
         with self._lock:
@@ -286,7 +285,85 @@ def _pin_thread_to_numa_node(node: int) -> None:
             pass
 
 
+# ----------------------------------------------------------------------
+# MPI detection (copied from stenpy for self‑containedness)
+# ----------------------------------------------------------------------
+try:
+    from mpi4py import MPI as _MPI
+    _HAS_MPI = True
+except ImportError:
+    _HAS_MPI = False
+    _MPI = None
 
+_MPI_ACTIVE = False
+_MPI_COMM = None
+_MPI_RANK = 0
+_MPI_WORLD = 1
+
+if _HAS_MPI:
+    try:
+        _MPI_COMM = _MPI.COMM_WORLD
+        _MPI_RANK = _MPI_COMM.Get_rank()
+        _MPI_WORLD = _MPI_COMM.Get_size()
+        if _MPI_WORLD > 1:
+            _MPI_ACTIVE = True
+    except Exception:
+        pass
+
+
+def _mpi_halo_exchange_1d_optimized(shard: torch.Tensor, radius: int) -> torch.Tensor:
+    """
+    Optimized idempotent halo exchange with overlapping communication.
+    Uses non-blocking sends/receives for maximum throughput.
+    """
+    global _MPI_ACTIVE, _MPI_COMM, _MPI_RANK, _MPI_WORLD
+
+    if not _MPI_ACTIVE or radius <= 0 or _MPI_WORLD <= 1:
+        return shard
+
+    try_cuda_aware = shard.is_cuda and _MPI.Get_library_version().find("CUDA") != -1
+
+    if not try_cuda_aware and shard.is_cuda:
+        device = shard.device
+        shard = shard.cpu()
+
+    n_local = shard.shape[0]
+    left_rank = _MPI_RANK - 1 if _MPI_RANK > 0 else None
+    right_rank = _MPI_RANK + 1 if _MPI_RANK < _MPI_WORLD - 1 else None
+
+    if n_local < 2 * radius:
+        return shard
+
+    send_left = shard[radius:2*radius].clone()
+    send_right = shard[-2*radius:-radius].clone()
+    recv_left = torch.zeros_like(send_left)
+    recv_right = torch.zeros_like(send_right)
+
+    reqs = []
+    if left_rank is not None:
+        reqs.append(_MPI_COMM.Irecv(recv_left.numpy(), source=left_rank, tag=20))
+        reqs.append(_MPI_COMM.Isend(send_left.numpy().copy(), dest=left_rank, tag=10))
+    if right_rank is not None:
+        reqs.append(_MPI_COMM.Irecv(recv_right.numpy(), source=right_rank, tag=10))
+        reqs.append(_MPI_COMM.Isend(send_right.numpy().copy(), dest=right_rank, tag=20))
+
+    if reqs:
+        _MPI.Request.Waitall(reqs)
+
+    if left_rank is not None:
+        shard[:radius] = recv_left
+    if right_rank is not None:
+        shard[-radius:] = recv_right
+
+    if not try_cuda_aware and shard.is_cuda:
+        shard = shard.to(device)
+
+    return shard
+
+
+# ----------------------------------------------------------------------
+# SpillManager
+# ----------------------------------------------------------------------
 class SpillManager:
     def __init__(
         self,
@@ -298,7 +375,7 @@ class SpillManager:
         numa_node:         int = 0,
     ) -> None:
         self.spill_dir         = spill_dir
-        max_bytes              = max(int(max_bytes * 0.9), 1) 
+        max_bytes              = max(int(max_bytes * 0.9), 1)
         self.max_bytes         = max_bytes
         self.on_file_deleted   = on_file_deleted
         self.on_write_complete = on_write_complete
@@ -371,7 +448,7 @@ class SpillManager:
     @staticmethod
     def _check_gds_available() -> bool:
         try:
-            import cupy as _cp 
+            import cupy as _cp
             return True
         except ImportError:
             return False
@@ -385,7 +462,7 @@ class SpillManager:
                     return False
             except (ImportError, AttributeError):
                 return False
-            
+
             dev_idx = tensor.device.index or 0
             with cp.cuda.Device(dev_idx):
                 mem = cp.cuda.UnownedMemory(
@@ -394,10 +471,10 @@ class SpillManager:
                     None,
                 )
                 mem_ptr = cp.cuda.MemoryPointer(mem, 0)
-                
+
                 with h5py.File(path, "w", driver="sec2") as f:
                     dset = f.create_dataset(
-                        "data", 
+                        "data",
                         shape=tensor.shape,
                         dtype=tensor.dtype,
                         chunks=True,
@@ -405,7 +482,7 @@ class SpillManager:
                     return False
         except Exception:
             return False
-        return False  
+        return False
 
     def _flush_batch(self) -> None:
         with self._batch_lock:
@@ -420,7 +497,7 @@ class SpillManager:
         )
         try:
             with h5py.File(batch_path, "w") as f:
-                entries = [] 
+                entries = []
                 for key, generation, arr, _old_gen in batch:
                     grp = f.create_group(f"{key}_gen{generation}")
                     grp.create_dataset(
@@ -452,7 +529,7 @@ class SpillManager:
                         except OSError:
                             pass
                 self._key_to_path[(key, generation)] = batch_path
-            
+
             self._files_lru[batch_path] = (file_size, "__batch__", entries)
             self.current_bytes += file_size
             if self.current_bytes > self.max_bytes:
@@ -528,13 +605,26 @@ class SpillManager:
                 grp_name = f"{key}_gen{generation}"
                 if grp_name in f:
                     arr = f[grp_name]["data"][:]
-                else:
+                elif "data" in f:
+                    is_batch = any(isinstance(f[k], h5py.Group) for k in f)
+                    if is_batch:
+                        raise DataLossError(
+                            f"Batch spill file {path} is missing group '{grp_name}' "
+                            f"for key='{key}' gen={generation} — entry was evicted or never written"
+                        )
                     arr = f["data"][:]
+                else:
+                    raise DataLossError(
+                        f"Neither '{grp_name}' nor root 'data' found in spill file {path} "
+                        f"for key='{key}' gen={generation}"
+                    )
             tensor = torch.from_numpy(arr)
             with self._lock:
                 if path in self._files_lru:
                     self._files_lru.move_to_end(path)
             return tensor
+        except DataLossError:
+            raise
         except Exception as exc:
             raise DataLossError(f"Corrupted spill file {path}: {exc}") from exc
 
@@ -570,6 +660,7 @@ class SpillManager:
             def _do():
                 self._write_sync(key, generation, tensor, old_generation)
             threading.Thread(target=_do, daemon=True, name="mm-spill-sync-fallback").start()
+
     def load_async(
         self,
         key: str,
@@ -812,7 +903,8 @@ class EvictionPolicy:
 
         self._temperature:   Dict[str, float] = {}
         self._last_update:   Dict[str, float] = {}
-        self._temp_halflife: float = 60.0  
+        self._temp_halflife: float = 60.0
+
     def touch(self, key: str) -> None:
         now = time.monotonic()
         if key in self._temperature:
@@ -935,6 +1027,9 @@ class Telemetry:
             return {f: getattr(self, f) for f in self._FIELDS}
 
 
+# ----------------------------------------------------------------------
+# MemoryManager – the main class
+# ----------------------------------------------------------------------
 class MemoryManager:
     def __init__(
         self,
@@ -950,7 +1045,7 @@ class MemoryManager:
         pool_depth:         int   = POOL_DEPTH,
     ) -> None:
         self._live_lock     = threading.RLock()
-        self._pool_lock     = threading.RLock()         
+        self._pool_lock     = threading.RLock()
         self._prefetch_lock = threading.RLock()
 
         self.gpu_fraction      = gpu_fraction
@@ -962,6 +1057,9 @@ class MemoryManager:
 
         self._pending_writes_lock = threading.RLock()
         self._pending_writes_cond = threading.Condition(self._pending_writes_lock)
+
+        self._release_schedule: Dict[int, List[str]] = {}
+        self._release_step_counter = 0
 
         _numa_node = 0
         if _HAS_NUMA and _ENABLE_NUMA and _numa_mod is not None:
@@ -990,7 +1088,7 @@ class MemoryManager:
         self._device_pools: Dict[torch.device, PerDevicePool] = {}
 
         self._buddy_allocators: Dict[torch.device, BuddyAllocator] = {}
-        self._buddy_lock = threading.RLock() 
+        self._buddy_lock = threading.RLock()
 
         self._live:           Dict[str, BufferState] = {}
         self._pending_writes: Dict[str, int]         = {}
@@ -1014,6 +1112,49 @@ class MemoryManager:
         self._cleaner_thread.start()
 
         atexit.register(self.shutdown)
+
+    # ------------------------------------------------------------------
+    # Fusion step management (for scheduler)
+    # ------------------------------------------------------------------
+    def release_at_step(self, tensor: torch.Tensor, step: int,
+                        key: Optional[str] = None) -> None:
+        """Schedule release of tensor after the given step."""
+        if tensor is None:
+            return
+        key = key or getattr(tensor, "_mm_key", None)
+        if key is None:
+            return
+        self._release_schedule.setdefault(step, []).append(key)
+
+    def advance_step(self) -> None:
+        """Called after each execution step to release buffers scheduled for this step."""
+        self._release_step_counter += 1
+        keys = self._release_schedule.pop(self._release_step_counter, [])
+        for key in keys:
+            state = self._live.get(key)
+            if state and state.tensor is not None:
+                self.release_buffer(state.tensor, key)
+
+    # ------------------------------------------------------------------
+    # Halo exchange – MPI‑aware
+    # ------------------------------------------------------------------
+    def halo_exchange(
+        self,
+        shard: torch.Tensor,
+        radius: int,
+        dims: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """
+        Perform halo exchange if MPI is active and the first dimension is in dims.
+        Otherwise returns the shard unchanged.
+        """
+        if radius <= 0:
+            return shard
+
+        if _MPI_ACTIVE and _MPI_WORLD > 1:
+            if dims is None or 0 in dims:
+                return _mpi_halo_exchange_1d_optimized(shard, radius)
+        return shard
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1430,7 +1571,7 @@ class MemoryManager:
 
         alloc_key = None
         if device.type == "cuda" and torch.cuda.is_available():
-            with self._buddy_lock:                                      
+            with self._buddy_lock:
                 if device not in self._buddy_allocators:
                     total = torch.cuda.get_device_properties(device).total_memory
                     self._buddy_allocators[device] = BuddyAllocator(int(total * 0.8))
@@ -1495,7 +1636,7 @@ class MemoryManager:
                     state.tensor      = None
 
             state.is_free    = True
-            state.is_evicted = keep_metadata  
+            state.is_evicted = keep_metadata
             if not keep_metadata:
                 del self._live[key]
             self.eviction.remove(key)
@@ -1733,14 +1874,6 @@ class MemoryManager:
         key    = key or f"field_{'_'.join(map(str, shape))}"
         tensor = self.get_buffer(shape, torch.float64, device, key, layout)
         return Field(tensor=tensor, spacing=spacing, origin=origin, mm=self, key=key)
-
-    def halo_exchange(
-        self,
-        shard: torch.Tensor,
-        radius: int,
-        dims: Optional[List[int]] = None,
-    ) -> torch.Tensor:
-        return shard
 
     def all_reduce_sum(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor
