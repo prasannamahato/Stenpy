@@ -154,7 +154,6 @@ _MPI_WORLD = 1
 
 
 def _detect_mpi():
-    """Detect if we're running under MPI and set globals"""
     global _MPI_ACTIVE, _MPI_COMM, _MPI_RANK, _MPI_WORLD
     if _HAS_MPI:
         try:
@@ -173,10 +172,6 @@ _detect_mpi()
 
 
 def _mpi_halo_exchange_1d_optimized(shard: torch.Tensor, radius: int) -> torch.Tensor:
-    """
-    Optimized idempotent halo exchange with overlapping communication.
-    Uses non-blocking sends/receives for maximum throughput.
-    """
     global _MPI_ACTIVE, _MPI_COMM, _MPI_RANK, _MPI_WORLD
     
     if not _MPI_ACTIVE or radius <= 0 or _MPI_WORLD <= 1:
@@ -364,7 +359,6 @@ class MemoryManager:
         return math.prod(shape) >= 1024
 
     def advance_step(self) -> None:
-        """No-op for basic MemoryManager; advanced MM overrides this."""
         pass
 
     def make_field(
@@ -2165,7 +2159,6 @@ def matmul_batched_gpu(
     a: torch.Tensor,
     alloc=None,
 ) -> torch.Tensor:
-    """Batched A @ Aᵀ  (uses torch.bmm)."""
     n = a.shape[-1]
     b = a.reshape(-1, n, n)                     
     r = b @ b.transpose(-1, -2)             
