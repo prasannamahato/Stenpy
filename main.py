@@ -897,9 +897,20 @@ def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
     if isinstance(expr, sp.core.function.AppliedUndef):
         func_name = type(expr).__name__
         if func_name == "_hessian":
-            canonical = "hessian"
-            extra_kw = {}
-            real_args = list(expr.args)
+            canonical  = "hessian"
+            extra_kw   = {}
+            real_args  = list(expr.args)
+            child_ids  = tuple(_compile_node(a, ctx) for a in real_args)
+            params: Dict[str, Any] = _op_params(canonical, ctx.dx, ctx.boundary)
+            params.update(extra_kw)
+            frozen  = tuple(sorted((k, v) for k, v in params.items() if isinstance(v, (int, float, str, bool))))
+            cse_key = (canonical, child_ids, frozen)
+            if cse_key in ctx.cse_cache: return ctx.cse_cache[cse_key]
+            if canonical not in stenpy.OP_REGISTRY:
+                raise ValueError(f"Unknown operator '{canonical}'.\nAvailable: {sorted(stenpy.OP_REGISTRY.keys())}")
+            nid = ctx.graph.add(canonical, child_ids, params)
+            ctx.cse_cache[cse_key] = nid
+            return nid
         else:
             canonical, extra_kw, real_args = _decode_kwparams(func_name, expr.args)
             def _get_ndim(node_id: str, fallback: int = 3) -> int:
@@ -948,66 +959,69 @@ def _compile_node(expr: sp.Expr, ctx: _CompileCtx) -> str:
             nid = ctx.graph.add(canonical, child_ids, params)
             ctx.cse_cache[cse_key] = nid
             return nid
-        if isinstance(expr, sp.Add):
-            ids = [_compile_node(o, ctx) for o in expr.args]
-            result_id = ids[0]
-            for nxt in ids[1:]:
-                cse_key = ("add", (result_id, nxt), ())
+    if isinstance(expr, sp.Add):
+        ids = [_compile_node(o, ctx) for o in expr.args]
+        result_id = ids[0]
+        for nxt in ids[1:]:
+            cse_key = ("add", (result_id, nxt), ())
+            if cse_key in ctx.cse_cache: result_id = ctx.cse_cache[cse_key]
+            else:
+                result_id = ctx.graph.add("add", (result_id, nxt), {})
+                ctx.cse_cache[cse_key] = result_id
+        return result_id
+    if isinstance(expr, sp.Mul):
+        operands = list(expr.args)
+        if sp.Integer(-1) in operands and len(operands) == 2:
+            other    = next(o for o in operands if o != sp.Integer(-1))
+            child_id = _compile_node(other, ctx)
+            cse_key  = ("neg", (child_id,), ())
+            if cse_key in ctx.cse_cache: return ctx.cse_cache[cse_key]
+            nid = ctx.graph.add("neg", (child_id,), {})
+            ctx.cse_cache[cse_key] = nid
+            return nid
+        ids = [_compile_node(o, ctx) for o in operands]
+        result_id = ids[0]
+        for nxt in ids[1:]:
+            cse_key = ("mul", (result_id, nxt), ())
+            if cse_key in ctx.cse_cache: result_id = ctx.cse_cache[cse_key]
+            else:
+                result_id = ctx.graph.add("mul", (result_id, nxt), {})
+                ctx.cse_cache[cse_key] = result_id
+        return result_id
+    if isinstance(expr, sp.Pow):
+        base_id = _compile_node(expr.args[0], ctx)
+        exp_val = float(expr.args[1])
+        if abs(exp_val - 0.5) < 1e-9:
+            cse_key = ("sqrt", (base_id,), ())
+            if cse_key in ctx.cse_cache: return ctx.cse_cache[cse_key]
+            nid = ctx.graph.add("sqrt", (base_id,), {})
+            ctx.cse_cache[cse_key] = nid
+            return nid
+        n = int(exp_val)
+        if abs(exp_val - n) < 1e-9 and abs(n) <= 16:
+            if n == 0:
+                one = ctx.graph.add("_constant", (), {"value": torch.tensor(1.0, dtype=torch.float64)})
+                return one
+            if n < 0:
+                pos_id = _compile_node(sp.Pow(expr.args[0], sp.Integer(-n)), ctx)
+                one = ctx.graph.add("_constant", (), {"value": torch.tensor(1.0, dtype=torch.float64)})
+                return ctx.graph.add("div", (one, pos_id), {})
+            result_id = base_id
+            for _ in range(n - 1):
+                cse_key = ("mul", (result_id, base_id), ())
                 if cse_key in ctx.cse_cache: result_id = ctx.cse_cache[cse_key]
                 else:
-                    result_id = ctx.graph.add("add", (result_id, nxt), {})
+                    result_id = ctx.graph.add("mul", (result_id, base_id), {})
                     ctx.cse_cache[cse_key] = result_id
             return result_id
-        if isinstance(expr, sp.Mul):
-            operands = list(expr.args)
-            if sp.Integer(-1) in operands and len(operands) == 2:
-                other    = next(o for o in operands if o != sp.Integer(-1))
-                child_id = _compile_node(other, ctx)
-                cse_key  = ("neg", (child_id,), ())
-                if cse_key in ctx.cse_cache: return ctx.cse_cache[cse_key]
-                nid = ctx.graph.add("neg", (child_id,), {})
-                ctx.cse_cache[cse_key] = nid
-                return nid
-            ids = [_compile_node(o, ctx) for o in operands]
-            result_id = ids[0]
-            for nxt in ids[1:]:
-                cse_key = ("mul", (result_id, nxt), ())
-                if cse_key in ctx.cse_cache: result_id = ctx.cse_cache[cse_key]
-                else:
-                    result_id = ctx.graph.add("mul", (result_id, nxt), {})
-                    ctx.cse_cache[cse_key] = result_id
-            return result_id
-        if isinstance(expr, sp.Pow):
-            base_id = _compile_node(expr.args[0], ctx)
-            exp_val = float(expr.args[1])
-            if abs(exp_val - 0.5) < 1e-9:
-                cse_key = ("sqrt", (base_id,), ())
-                if cse_key in ctx.cse_cache: return ctx.cse_cache[cse_key]
-                nid = ctx.graph.add("sqrt", (base_id,), {})
-                ctx.cse_cache[cse_key] = nid
-                return nid
-            n = int(exp_val)
-            if abs(exp_val - n) < 1e-9 and abs(n) <= 16:
-                if n == 0:
-                    one = ctx.graph.add("_constant", (), {"value": torch.tensor(1.0, dtype=torch.float64)})
-                    return one
-                if n < 0:
-                    pos_id = _compile_node(sp.Pow(expr.args[0], sp.Integer(-n)), ctx)
-                    one = ctx.graph.add("_constant", (), {"value": torch.tensor(1.0, dtype=torch.float64)})
-                    return ctx.graph.add("div", (one, pos_id), {})
-                result_id = base_id
-                for _ in range(n - 1):
-                    cse_key = ("mul", (result_id, base_id), ())
-                    if cse_key in ctx.cse_cache: result_id = ctx.cse_cache[cse_key]
-                    else:
-                        result_id = ctx.graph.add("mul", (result_id, base_id), {})
-                        ctx.cse_cache[cse_key] = result_id
-                return result_id
-            log_id = ctx.graph.add("log", (base_id,), {})
-            const_nid = _compile_node(sp.Float(exp_val), ctx)
-            mul_id = ctx.graph.add("mul", (log_id, const_nid), {})
-            return ctx.graph.add("exp", (mul_id,), {})
-        raise ValueError(f"Unsupported SymPy node {type(expr).__name__}: {expr}\nUse recognised operators and arithmetic (+, *, **).")
+        log_id    = ctx.graph.add("log", (base_id,), {})
+        const_nid = _compile_node(sp.Float(exp_val), ctx)
+        mul_id    = ctx.graph.add("mul", (log_id, const_nid), {})
+        return ctx.graph.add("exp", (mul_id,), {})
+    raise ValueError(
+        f"Unsupported SymPy node {type(expr).__name__}: {expr}\n"
+        "Use recognised operators and arithmetic (+, *, **)."
+    )
 
 def compile_expression(
     expr_str:  str,
@@ -2337,7 +2351,7 @@ def _hdf5_direct_chunked_run(
             "input_gb": bytes_in / 1024**3, "output_gb": out_gb,
         }
     except Exception as exc:
-        _logger.error("Direct HDF5 chunked run failed, falling back to safe row-stream mode")
+        _logger.error("Direct HDF5 chunked run failed")
         _logger.error(f"Exception: {type(exc).__name__}: {exc}")
         _logger.error(traceback.format_exc())
         try:
@@ -2352,14 +2366,21 @@ def _hdf5_direct_chunked_run(
             _logger.info(f"Wrote failure diagnostics to {diag}")
         except Exception:
             _logger.warning("Unable to write failure diagnostics file")
+        is_memory_error = _is_cuda_oom(exc) or isinstance(exc, MemoryError)
+        if not is_memory_error:
+            _full_vram_release(device)
+            raise
+        _logger.warning(
+            "Memory error detected — falling back to safe row-stream on CPU"
+        )
         _full_vram_release(device)
         fallback_device = torch.device("cpu") if device.type == "cuda" else device
-        if device.type == "cuda":
-            _logger.warning("Retrying safe row-stream on CPU to avoid GPU/OOM issues")
         return _hdf5_safe_row_stream(
-            expr_str=expr_str, field_paths=field_paths, scalar_map=scalar_map, dx=dx, boundary=boundary,
-            out_path=out_path, spacing=spacing, origin=origin, device=fallback_device,
-            out_trailing=out_trailing, halo=halo, total_rows=total_rows, primary_shape=primary_shape, verbose=verbose,
+            expr_str=expr_str, field_paths=field_paths, scalar_map=scalar_map,
+            dx=dx, boundary=boundary, out_path=out_path, spacing=spacing,
+            origin=origin, device=fallback_device, out_trailing=out_trailing,
+            halo=halo, total_rows=total_rows, primary_shape=primary_shape,
+            verbose=verbose,
         )
 
 # ----------------------------------------------------------------------
