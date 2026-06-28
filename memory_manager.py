@@ -312,10 +312,7 @@ if _HAS_MPI:
 
 
 def _mpi_halo_exchange_1d_optimized(shard: torch.Tensor, radius: int) -> torch.Tensor:
-    """
-    Optimized idempotent halo exchange with overlapping communication.
-    Uses non-blocking sends/receives for maximum throughput.
-    """
+
     global _MPI_ACTIVE, _MPI_COMM, _MPI_RANK, _MPI_WORLD
 
     if not _MPI_ACTIVE or radius <= 0 or _MPI_WORLD <= 1:
@@ -1118,7 +1115,6 @@ class MemoryManager:
     # ------------------------------------------------------------------
     def release_at_step(self, tensor: torch.Tensor, step: int,
                         key: Optional[str] = None) -> None:
-        """Schedule release of tensor after the given step."""
         if tensor is None:
             return
         key = key or getattr(tensor, "_mm_key", None)
@@ -1127,7 +1123,6 @@ class MemoryManager:
         self._release_schedule.setdefault(step, []).append(key)
 
     def advance_step(self) -> None:
-        """Called after each execution step to release buffers scheduled for this step."""
         self._release_step_counter += 1
         keys = self._release_schedule.pop(self._release_step_counter, [])
         for key in keys:
@@ -1144,10 +1139,6 @@ class MemoryManager:
         radius: int,
         dims: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        """
-        Perform halo exchange if MPI is active and the first dimension is in dims.
-        Otherwise returns the shard unchanged.
-        """
         if radius <= 0:
             return shard
 
