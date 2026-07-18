@@ -1,7 +1,5 @@
-#fused_compiler.py
-
+# fused_compiler.py
 from __future__ import annotations
-
 import hashlib
 import math
 import threading
@@ -10,21 +8,14 @@ import importlib.util
 import sys
 import os
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from stenpy import OP_METADATA, OP_REGISTRY
-
+from stenpy import OP_METADATA, OP_REGISTRY, _uid
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from stenpy import Graph, Runtime
-
-
-# ---------------------------------------------------------------------------
-# 1. Cost model helpers
-# ---------------------------------------------------------------------------
 
 def compute_flops(group: "FusionGroup") -> int:
     return group.flops
@@ -51,10 +42,66 @@ def estimate_occupancy(regs: int, max_regs_per_thread: int = 64) -> float:
 def classify_memory_bound(group: "FusionGroup", ridge_point: float = 11.3) -> bool:
     return arithmetic_intensity(group) < ridge_point
 
+class StencilTap(NamedTuple):
+    offset: Tuple[int, int, int]  
+    coeff_expr: str              
+    src_channel: int = 0          
+    dst_channel: int = 0           
 
-# ---------------------------------------------------------------------------
-# 2. IR (Intermediate Representation)
-# ---------------------------------------------------------------------------
+STENCIL_DESCRIPTORS = {
+    "laplacian":  [ 
+        StencilTap(( 1,0,0), "1.0/dx2", 0, 0), 
+        StencilTap((-1,0,0), "1.0/dx2", 0, 0),
+        StencilTap(( 0,1,0), "1.0/dy2", 0, 0), 
+        StencilTap(( 0,-1,0), "1.0/dy2", 0, 0),
+        StencilTap(( 0,0,1), "1.0/dz2", 0, 0), 
+        StencilTap(( 0,0,-1), "1.0/dz2", 0, 0),
+        StencilTap(( 0,0,0), "-2.0/dx2-2.0/dy2-2.0/dz2", 0, 0) 
+    ],
+
+    "gradient":   [ 
+        StencilTap(( 1,0,0), "0.5/dx", 0, 0), StencilTap((-1,0,0), "-0.5/dx", 0, 0),
+        StencilTap(( 0,1,0), "0.5/dy", 0, 1), StencilTap(( 0,-1,0), "-0.5/dy", 0, 1),
+        StencilTap(( 0,0,1), "0.5/dz", 0, 2), StencilTap(( 0,0,-1), "-0.5/dz", 0, 2)
+    ],
+
+    "divergence": [ 
+        StencilTap(( 1,0,0), "0.5/dx", 0, 0), StencilTap((-1,0,0), "-0.5/dx", 0, 0),
+        StencilTap(( 0,1,0), "0.5/dy", 1, 0), StencilTap(( 0,-1,0), "-0.5/dy", 1, 0),
+        StencilTap(( 0,0,1), "0.5/dz", 2, 0), StencilTap(( 0,0,-1), "-0.5/dz", 2, 0)
+    ],
+
+    "curl": [
+        StencilTap((0,1,0), "0.5/dy", 2, 0), StencilTap((0,-1,0), "-0.5/dy", 2, 0),
+        StencilTap((0,0,1), "-0.5/dz", 1, 0), StencilTap((0,0,-1), "0.5/dz", 1, 0),
+        StencilTap((0,0,1), "0.5/dz", 0, 1), StencilTap((0,0,-1), "-0.5/dz", 0, 1),
+        StencilTap((1,0,0), "-0.5/dx", 2, 1), StencilTap((-1,0,0), "0.5/dx", 2, 1),
+        StencilTap((1,0,0), "0.5/dx", 1, 2), StencilTap((-1,0,0), "-0.5/dx", 1, 2),
+        StencilTap((0,1,0), "-0.5/dy", 0, 2), StencilTap((0,-1,0), "0.5/dy", 0, 2),
+    ],
+
+    "hessian": [
+        StencilTap((1,0,0), "1.0/dx2", 0, 0), StencilTap((-1,0,0), "1.0/dx2", 0, 0),
+        StencilTap((0,0,0), "-2.0/dx2", 0, 0),
+        StencilTap((0,1,0), "1.0/dy2", 0, 1), StencilTap((0,-1,0), "1.0/dy2", 0, 1),
+        StencilTap((0,0,0), "-2.0/dy2", 0, 1),
+        StencilTap((0,0,1), "1.0/dz2", 0, 2), StencilTap((0,0,-1), "1.0/dz2", 0, 2),
+        StencilTap((0,0,0), "-2.0/dz2", 0, 2),
+        StencilTap((1,1,0), "0.25/(dx*dy)", 0, 3), StencilTap((-1,-1,0), "0.25/(dx*dy)", 0, 3),
+        StencilTap((1,-1,0), "-0.25/(dx*dy)", 0, 3), StencilTap((-1,1,0), "-0.25/(dx*dy)", 0, 3),
+        StencilTap((1,0,1), "0.25/(dx*dz)", 0, 4), StencilTap((-1,0,-1), "0.25/(dx*dz)", 0, 4),
+        StencilTap((1,0,-1), "-0.25/(dx*dz)", 0, 4), StencilTap((-1,0,1), "-0.25/(dx*dz)", 0, 4),
+        StencilTap((0,1,1), "0.25/(dy*dz)", 0, 5), StencilTap((0,-1,-1), "0.25/(dy*dz)", 0, 5),
+        StencilTap((0,1,-1), "-0.25/(dy*dz)", 0, 5), StencilTap((0,-1,1), "-0.25/(dy*dz)", 0, 5),
+    ],
+}
+
+def get_stencil_output_channels(op_name: str) -> int:
+    channel_map = {
+        "laplacian": 1, "gradient": 3, "divergence": 1,
+        "curl": 3, "hessian": 6,
+    }
+    return channel_map.get(op_name, 1)
 
 class VirtualRegister:
     __slots__ = ("id", "dtype", "producer")
@@ -128,11 +175,6 @@ class IRProgram:
         self.output_map: Dict[str, VirtualRegister] = {}
         self.constants: Dict[str, Any] = {}
 
-
-# ---------------------------------------------------------------------------
-# 3. Fusion group and planner
-# ---------------------------------------------------------------------------
-
 class FusionGroup:
     def __init__(self):
         self.nodes: List[str] = []
@@ -149,7 +191,8 @@ class FusionGroup:
         self.boundary_mode: str = "periodic"
         self.op_names: Dict[str, str] = {}     
 
-FUSIBLE_OPS = {"add","sub","mul","div","exp","log","sqrt","sin","cos","tanh","neg","laplacian"}
+FUSIBLE_OPS = {"add","sub","mul","div","exp","log","sqrt","sin","cos","tanh","neg",
+               "laplacian","gradient","divergence","curl","hessian"}
 
 def _broadcast_shapes(s1: Tuple[int, ...], s2: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
     if s1 == s2:
@@ -249,6 +292,7 @@ def plan_fusion(graph: "Graph") -> List[FusionGroup]:
         out_shape = graph.get_node_shape(nid)
         if out_shape is not None:
             g.outputs[nid] = {"shape": out_shape, "dtype": torch.float64}
+            g.common_shape = out_shape        
         meta = OP_METADATA.get(node.op_name, {})
         mult = math.prod(out_shape) if out_shape else 1
         g.flops = meta.get("flops_per_element", 0) * mult
@@ -273,14 +317,8 @@ def plan_fusion(graph: "Graph") -> List[FusionGroup]:
                 for node_id in merged.nodes:
                     groups[node_id] = merged
 
-    # Return unique groups
     unique = list({id(g): g for g in groups.values()}.values())
     return unique
-
-
-# ---------------------------------------------------------------------------
-# 4. Lowering to IR
-# ---------------------------------------------------------------------------
 
 def _default_strides(shape: Tuple[int, ...]) -> Tuple[int, ...]:
     strides = [1]
@@ -363,11 +401,6 @@ def lower_graph(graph: "Graph", node_ids: List[str]) -> IRProgram:
 
     return ir
 
-
-# ---------------------------------------------------------------------------
-# 5. Triton code generator – broadcast‑aware, 1D grid, safe boundaries
-# ---------------------------------------------------------------------------
-
 class TritonCodegen:
     def __init__(self, block_size: int = 512, num_warps: int = 4):
         self.block_size = block_size
@@ -408,6 +441,7 @@ class TritonCodegen:
             lines.append("    j = offset % ny")
             lines.append("    idx_centre = i * ny + j")
         else:
+            lines.append("    i = offset")
             lines.append("    idx_centre = offset")
 
         for instr in ir.instructions:
@@ -439,7 +473,7 @@ class TritonCodegen:
                         lines.append(f"    n_i{idx} = tl.minimum(tl.maximum(i + {off[0]}, 0), nx-1)")
                         lines.append(f"    n_j{idx} = tl.minimum(tl.maximum(j + {off[1]}, 0), ny-1)")
                     lines.append(f"    n_idx{idx} = n_i{idx} * ny + n_j{idx}")
-                else:   
+                else:  
                     if boundary_mode == "periodic":
                         lines.append(f"    n_i{idx} = (i + {off[0]} + nx) % nx")
                     else:
@@ -459,7 +493,7 @@ class TritonCodegen:
             lines.append(f"    r{stencil_instr.outputs[0].id} -= 2.0 * c / {stencil_instr.dx_sq}")
             lines.append(f"    r{stencil_instr.outputs[0].id} -= 2.0 * c / {stencil_instr.dy_sq}")
             lines.append(f"    r{stencil_instr.outputs[0].id} -= 2.0 * c / {stencil_instr.dz_sq}")
-
+        _op_symbol = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
         for instr in ir.instructions:
             if isinstance(instr, Stencil7pt):
                 continue   
@@ -469,7 +503,7 @@ class TritonCodegen:
                 lines.append(f"    tl.store({instr.tensor_name} + idx_centre, r{instr.inputs[0].id}, mask=mask)")
             elif isinstance(instr, BinaryOp):
                 a, b, out = instr.inputs[0].id, instr.inputs[1].id, instr.outputs[0].id
-                lines.append(f"    r{out} = r{a} {instr.op} r{b}")
+                lines.append(f"    r{out} = r{a} {_op_symbol[instr.op]} r{b}")
             elif isinstance(instr, UnaryOp):
                 a, out = instr.inputs[0].id, instr.outputs[0].id
                 if instr.op == "tanh":
@@ -493,11 +527,6 @@ class TritonCodegen:
                 term = f"{coords[d]}*{padded_strides[d]}"
             terms.append(term)
         return " + ".join(terms)
-
-
-# ---------------------------------------------------------------------------
-# 6. Kernel cache
-# ---------------------------------------------------------------------------
 
 class KernelCache:
     def __init__(self, max_size: int = 256):
@@ -527,10 +556,6 @@ class KernelCache:
             if len(self.cache) > self.max_size:
                 self.cache.popitem(last=False)
 
-
-# ---------------------------------------------------------------------------
-# 7. Execution tasks and scheduler
-# ---------------------------------------------------------------------------
 
 class ExecutionTask:
     pass
@@ -590,8 +615,6 @@ def build_schedule(fusion_groups: List[FusionGroup],
             node_to_fused_task[nid] = task
 
     all_group_nodes: set = set(node_to_fused_task.keys())
-
-    # Build tasks in topological order so inputs are always ready
     tasks: List[ExecutionTask] = []
     for nid in graph._order:
         if nid in all_group_nodes:
@@ -606,13 +629,13 @@ def build_schedule(fusion_groups: List[FusionGroup],
     return tasks
 
 
-# ---------------------------------------------------------------------------
-# 8. Main entry point
-# ---------------------------------------------------------------------------
-
 def compile_and_execute(graph: "Graph",
                         runtime: "Runtime",
                         seed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+
+    if runtime.device.type != "cuda":
+        raise ValueError("Fused execution requires a CUDA device. "
+                         "Use Runtime(device='cuda') or let the Runtime fall back to original.")
 
     fusion_groups = plan_fusion(graph)
 
@@ -621,6 +644,26 @@ def compile_and_execute(graph: "Graph",
     results = dict(seed or {})
     mm = runtime.mm
     step = 0
+
+    ref_count: Dict[str, int] = {nid: 0 for nid in graph._nodes}
+    for task in schedule:
+        consumed_ids = set(task.inputs) if isinstance(task, NormalNodeTask) \
+            else set(task.group.inputs.keys())
+        for dep in consumed_ids:
+            if dep in ref_count:
+                ref_count[dep] += 1
+
+    def _release_consumed(consumed_ids) -> None:
+        for dep in set(consumed_ids):
+            if dep not in ref_count:
+                continue
+            ref_count[dep] -= 1
+            if ref_count[dep] <= 0 and dep in results:
+                dep_node = graph._nodes.get(dep)
+                if dep_node is None or dep_node.op_name != "_constant":
+                    val = results.pop(dep)
+                    if isinstance(val, torch.Tensor) and mm.owns(val):
+                        mm.release(val)
 
     for task in schedule:
         if isinstance(task, NormalNodeTask):
@@ -648,7 +691,16 @@ def compile_and_execute(graph: "Graph",
             if "mm" in sig_params:
                 kwargs["mm"] = mm
             output = op_fn(*inputs, **kwargs)
+            if (
+                isinstance(output, torch.Tensor)
+                and not output.is_complex()
+                and not mm.owns(output)
+                and output.is_contiguous()
+                and mm.should_manage(output.shape)
+            ):
+                output = mm.adopt(output, key=_uid(task.node_id + "_out"))
             results[task.node_id] = output
+            _release_consumed(task.inputs)
 
         elif isinstance(task, FusedKernelTask):
             for inp_name in sorted(task.group.inputs.keys()):
@@ -695,8 +747,7 @@ def compile_and_execute(graph: "Graph",
 
             for out_id, out_tensor in outputs.items():
                 results[out_id] = out_tensor
+            _release_consumed(list(task.group.inputs.keys()))
 
         step += 1
-        mm.advance_step()
-
     return results
